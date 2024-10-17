@@ -1,177 +1,221 @@
+# messaging_client.py
+
 import time
+import socketio  # For WebSocket communication
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import NoSuchElementException
-from selenium.webdriver.common.keys import Keys  # Import Keys for sending special keys
+from selenium.common.exceptions import NoSuchElementException, ElementNotInteractableException
+import os
+import logging
+import signal
+import sys
+import uuid
+
+# Setup Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Configuration
+WEBSOCKET_SERVER_URL = os.getenv('WEBSOCKET_SERVER_URL', 'http://localhost:3000')
+USER_ID = os.getenv('USER_ID', 'pearl@easyspeak-aac.com')  # Replace with your actual user ID or email
+POLL_INTERVAL = 5  # Seconds between polling requests
+MAX_POLLS = 60  # Maximum number of polls before timing out
+
+# Initialize Socket.IO client
+sio = socketio.Client()
+
+# Flag to control the main loop
+running = True
+
+def signal_handler(sig, frame):
+    global running
+    logger.info('Shutting down messaging client...')
+    running = False
+    sio.disconnect()
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+@sio.event(namespace='/messaging')
+def connect():
+    logger.info('Connected to WebSocket server.')
+
+@sio.event(namespace='/messaging')
+def connect_error(data):
+    logger.error('Connection failed:', data)
+
+@sio.event(namespace='/messaging')
+def disconnect():
+    logger.info('Disconnected from WebSocket server.')
+
+def initialize_selenium():
+    chrome_options = Options()
+    chrome_options.add_experimental_option("debuggerAddress", "localhost:9222")
+    driver = webdriver.Chrome(options=chrome_options)
+    return driver
+
+def detect_new_message(driver, last_message_id):
+    """
+    Detects the latest message in Slack.
+
+    Args:
+        driver: Selenium WebDriver instance.
+        last_message_id: The ID of the last processed message.
+
+    Returns:
+        Tuple (message_id, content) or (None, None) if no new message.
+    """
+    try:
+        # Locate message elements
+        messages = driver.find_elements(By.CSS_SELECTOR, 'div.c-message_kit__background')
+        if not messages:
+            return (None, None)
+
+        # Assume the last message is the latest
+        latest_message = messages[-1]
+
+        # Extract message ID (timestamp)
+        try:
+            timestamp_element = latest_message.find_element(By.CSS_SELECTOR, 'a.c-timestamp')
+            message_id = timestamp_element.get_attribute('data-ts')
+        except NoSuchElementException:
+            message_id = str(uuid.uuid4())  # Fallback to UUID if timestamp not found
+
+        # Check if this message has been processed
+        if message_id == last_message_id:
+            return (None, None)
+
+        # Extract sender name
+        try:
+            sender_element = latest_message.find_element(By.CSS_SELECTOR, 'button.c-message__sender_button')
+            sender_name = sender_element.text.strip()
+        except NoSuchElementException:
+            try:
+                sender_span = latest_message.find_element(By.CSS_SELECTOR, 'span.offscreen[data-qa^="aria-labelledby"]')
+                sender_name = sender_span.text.strip()
+            except NoSuchElementException:
+                sender_name = 'Unknown'
+
+        # Extract message content
+        try:
+            message_text_element = latest_message.find_element(By.CSS_SELECTOR, 'div.p-rich_text_section')
+            message_text = message_text_element.text.strip()
+        except NoSuchElementException:
+            message_text = ''
+
+        # Skip messages sent by self to prevent feedback loops
+        if sender_name.lower() == USER_ID.lower():
+            return (None, None)
+
+        return (message_id, message_text)
+
+    except Exception as e:
+        logger.exception('Error detecting new message.')
+        return (None, None)
+
+def send_message_via_websocket(content):
+    """
+    Sends the new message to the back end via WebSocket.
+
+    Args:
+        content (str): The content of the message.
+    """
+    try:
+        # Only send the content of the message
+        sio.emit('newMessage', {
+            'content': content,
+            'user_id': USER_ID
+        }, namespace='/messaging')
+        logger.info(f'Sent message via WebSocket: {content}')
+    except Exception as e:
+        logger.exception('Failed to send message via WebSocket.')
+
+def send_response_to_slack(response):
+    """
+    Uses Selenium to send the selected response to Slack.
+
+    Args:
+        response (str): The selected response to send.
+    """
+    try:
+        # Locate the message input box
+        message_input = driver.find_element(By.CSS_SELECTOR, 'div[data-qa="message_input"] div.ql-editor')
+
+        # Click to focus
+        message_input.click()
+
+        # Clear any existing text (optional)
+        # message_input.clear()
+
+        # Type the response
+        message_input.send_keys(response)
+
+        # Locate the send button and click it
+        send_button = driver.find_element(By.CSS_SELECTOR, 'button[data-qa="texty_send_button"]')
+        send_button.click()
+
+        logger.info(f'Sent response to Slack: {response}')
+
+    except NoSuchElementException as e:
+        logger.exception('Failed to locate Slack message input or send button.')
+    except ElementNotInteractableException as e:
+        logger.exception('Slack message input or send button not interactable.')
+    except Exception as e:
+        logger.exception('Failed to send response to Slack.')
+
+@sio.on('sendSelectedResponse', namespace='/messaging')
+def on_send_selected_response(data):
+    selected_response = data.get('selected_response')
+    if selected_response:
+        logger.info(f'Received selected response: {selected_response}')
+        send_response_to_slack(selected_response)
+    else:
+        logger.error('Received sendSelectedResponse event without selected_response')
 
 def messaging_client():
     global driver
 
-    # Configure Selenium WebDriver to connect to the existing Chrome session
-    chrome_options = Options()
-    chrome_options.add_experimental_option("debuggerAddress", "localhost:9222")
-    driver = webdriver.Chrome(options=chrome_options)
-
+    # Connect to WebSocket server
     try:
-        # Verify that we're connected to the browser
-        print('Connected to existing Chrome session.')
-
-        # Get all window handles (tabs)
-        window_handles = driver.window_handles
-
-        # Flag to indicate if the correct tab was found
-        tab_found = False
-
-        # Iterate over each tab to find the messaging platform
-        for handle in window_handles:
-            driver.switch_to.window(handle)
-            current_url = driver.current_url
-            current_title = driver.title
-            print(f'Checking tab with URL: {current_url} and Title: {current_title}')
-
-            # Identify the tab based on URL
-            if 'slack.com' in current_url:
-                print('Found the messaging platform tab based on URL.')
-                tab_found = True
-                break
-
-        if not tab_found:
-            print('Could not find the messaging platform tab. Please ensure it is open in your browser.')
-            return
-
-        last_processed_message_id = None  # ID of the last message processed
-
-        # Main loop to check for new messages
-        while True:
-            # Wait for new messages to load
-            time.sleep(2)
-
-            # Locate the message elements
-            messages = driver.find_elements(By.CSS_SELECTOR, 'div.c-message_kit__background')
-            print(f"Found {len(messages)} messages.")
-
-            # Process messages in reverse order (assuming newest messages are at the end)
-            for message_element in messages[::-1]:
-                # Extract message ID (timestamp)
-                try:
-                    timestamp_element = message_element.find_element(By.CSS_SELECTOR, 'a.c-timestamp')
-                    message_id = timestamp_element.get_attribute('data-ts')
-                    print(f"Current message ID: {message_id}")
-                except NoSuchElementException:
-                    print("Timestamp not found, skipping message.")
-                    continue
-
-                # If the current message ID is equal to last processed, no new messages
-                if message_id == last_processed_message_id:
-                    print("No new messages to process.")
-                    break  # Exit the loop to wait and check again later
-
-                # Extract sender name
-                sender_name = ''
-                try:
-                    # Try to find the sender name in the button (for messages that include it)
-                    sender_element = message_element.find_element(By.CSS_SELECTOR, 'button.c-message__sender_button')
-                    sender_name = sender_element.text.strip()
-                    print("Sender name found in button:", sender_name)
-                except NoSuchElementException:
-                    try:
-                        # Try to find the sender name in the offscreen span (for messages without explicit sender name)
-                        sender_span = message_element.find_element(By.CSS_SELECTOR, 'span.offscreen[data-qa^="aria-labelledby"]')
-                        sender_name = sender_span.text.strip()
-                        print("Sender name found in offscreen span:", sender_name)
-                    except NoSuchElementException:
-                        sender_name = ''
-                        print("Sender name not found in message.")
-                        # If we cannot find the sender name, skip this message
-                        continue
-
-                # Extract message text
-                try:
-                    message_text_element = message_element.find_element(By.CSS_SELECTOR, 'div.p-rich_text_section')
-                    message_text = message_text_element.text.strip()
-                    print("message_text:", message_text)
-                except NoSuchElementException:
-                    message_text = ''
-                    print('Message text not found.')
-
-                # Update the last processed message ID
-                last_processed_message_id = message_id
-
-                # Check if the message is from you
-                if sender_name.lower() == 'pearl hulbert'.lower() and sender_name != '':
-                    print(f'Message from self detected:')
-                    print(f'Sender: {sender_name}')
-                    print(f'Message: {message_text}')
-                    print(f'Message ID: {message_id}')
-
-                    # Ask the user if they want to send a follow-up message
-                    send_follow_up = input('Do you want to send a follow-up message? (y/n): ').strip().lower()
-                    if send_follow_up == 'y':
-                        # Prompt the user for a follow-up message
-                        user_response = input('Enter your follow-up message: ')
-
-                        # Send the user's response in Slack
-                        try:
-                            # Find the message input area
-                            message_input = driver.find_element(By.CSS_SELECTOR, 'div.ql-editor[contenteditable="true"]')
-                            # Click on the message input area to focus
-                            message_input.click()
-                            # Enter the user's response
-                            message_input.send_keys(user_response)
-                            # Send the message by pressing Enter
-                            message_input.send_keys(Keys.RETURN)
-                            print('Follow-up message sent.')
-                        except Exception as e:
-                            print('Failed to send follow-up message:', e)
-                    else:
-                        print('Follow-up message not sent.')
-
-                    # Since we prompted the user, break after processing
-                    break
-
-                else:
-                    # Message from someone else
-                    print(f'New message detected:')
-                    print(f'Sender: {sender_name}')
-                    print(f'Message: {message_text}')
-                    print(f'Message ID: {message_id}')
-
-                    # Ask the user if they want to reply
-                    send_reply = input('Do you want to reply? (y/n): ').strip().lower()
-                    if send_reply == 'y':
-                        # Prompt the user for a reply
-                        user_response = input('Enter your reply: ')
-
-                        # Send the user's response in Slack
-                        try:
-                            # Find the message input area
-                            message_input = driver.find_element(By.CSS_SELECTOR, 'div.ql-editor[contenteditable="true"]')
-                            # Click on the message input area to focus
-                            message_input.click()
-                            # Enter the user's response
-                            message_input.send_keys(user_response)
-                            # Send the message by pressing Enter
-                            message_input.send_keys(Keys.RETURN)
-                            print('Message sent.')
-                        except Exception as e:
-                            print('Failed to send message:', e)
-                    else:
-                        print('Reply not sent.')
-
-                    # Since we processed the new message, break after processing
-                    break
-
-            # Wait before checking again
-            time.sleep(5)
-
+        sio.connect(f'{WEBSOCKET_SERVER_URL}/messaging', namespaces=['/messaging'])
+        logger.info(f'Connecting to WebSocket server: {WEBSOCKET_SERVER_URL}/messaging')
     except Exception as e:
-        print('An error occurred:', e)
-    finally:
-        # Do not close the browser when done
-        pass
+        logger.exception('Failed to connect to WebSocket server.')
+        sys.exit(1)
+
+    # Initialize Selenium WebDriver
+    driver = initialize_selenium()
+    logger.info('Selenium WebDriver initialized and connected to Chrome.')
+
+    # Initialize last_message_id
+    last_message_id = None
+
+    while running:
+        try:
+            message_id, content = detect_new_message(driver, last_message_id)
+            if message_id and content:
+                logger.info(f'New message detected: {content} (ID: {message_id})')
+                # Send the message to the back end via WebSocket
+                send_message_via_websocket(content)
+                # Update the last_message_id
+                last_message_id = message_id
+            else:
+                logger.debug('No new messages detected.')
+        except Exception as e:
+            logger.exception('Error in main loop.')
+
+        # Poll every POLL_INTERVAL seconds
+        time.sleep(POLL_INTERVAL)
 
 if __name__ == '__main__':
-    # Declare the driver variable globally
-    global driver
-    messaging_client()
+    try:
+        # Start the messaging client
+        messaging_client()
+    except Exception as e:
+        logger.exception('Failed to start messaging client.')
