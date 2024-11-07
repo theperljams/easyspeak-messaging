@@ -18,6 +18,7 @@ import logging
 import signal
 import sys
 import uuid
+import datetime  # For timestamp conversion
 
 # Setup Logging
 logging.basicConfig(
@@ -80,13 +81,13 @@ def detect_new_message(driver, last_message_id):
         last_message_id: The ID of the last processed message.
 
     Returns:
-        Tuple (message_id, content) or (None, None) if no new message.
+        Tuple (message_id, content, timestamp) or (None, None, None) if no new message.
     """
     try:
         # Locate message elements
         messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
         if not messages:
-            return (None, None)
+            return (None, None, None)
 
         # Assume the last message is the latest
         latest_message = messages[-1]
@@ -95,12 +96,16 @@ def detect_new_message(driver, last_message_id):
         try:
             timestamp_element = latest_message.find_element(By.CSS_SELECTOR, "a.c-timestamp")
             message_id = timestamp_element.get_attribute("data-ts")
+            # Convert timestamp to integer (milliseconds since epoch)
+            ts_float = float(message_id)
+            timestamp = int(ts_float * 1000)
         except NoSuchElementException:
             message_id = str(uuid.uuid4())  # Fallback to UUID if timestamp not found
+            timestamp = None
 
         # Check if this message has been processed
         if message_id == last_message_id:
-            return (None, None)
+            return (None, None, None)
 
         # Extract sender name
         try:
@@ -125,29 +130,30 @@ def detect_new_message(driver, last_message_id):
         # Skip messages sent by self to prevent feedback loops
         if "pearl" in sender_name.lower():
             logger.debug(f"Skipping message from sender: {sender_name}")
-            return (None, None)
+            return (None, None, None)
 
-        return (message_id, message_text)
+        return (message_id, message_text, timestamp)
 
     except Exception as e:
         logger.exception("Error detecting new message.")
-        return (None, None)
+        return (None, None, None)
 
-def send_message_via_websocket(content):
+def send_message_via_websocket(content, timestamp):
     """
     Sends the new message to the back end via WebSocket.
 
     Args:
         content (str): The content of the message.
+        timestamp (int): The timestamp of the message in milliseconds since epoch.
     """
     try:
-        # Only send the content of the message
+        # Send the content and timestamp of the message
         sio.emit(
             "newMessage",
-            {"content": content, "user_id": USER_ID},
+            {"content": content, "timestamp": timestamp, "user_id": USER_ID},
             namespace="/messaging",
         )
-        logger.info(f"Sent message via WebSocket: {content}")
+        logger.info(f'Sent message via WebSocket: "{content}" at {timestamp}')
     except Exception as e:
         logger.exception("Failed to send message via WebSocket.")
 
@@ -244,11 +250,11 @@ def messaging_client():
 
     while running:
         try:
-            message_id, content = detect_new_message(driver, last_message_id)
+            message_id, content, timestamp = detect_new_message(driver, last_message_id)
             if message_id and content:
-                logger.info(f"New message detected: {content} (ID: {message_id})")
+                logger.info(f'New message detected: "{content}" at {timestamp} (ID: {message_id})')
                 # Send the message to the back end via WebSocket
-                send_message_via_websocket(content)
+                send_message_via_websocket(content, timestamp)
                 # Update the last_message_id
                 last_message_id = message_id
             else:
