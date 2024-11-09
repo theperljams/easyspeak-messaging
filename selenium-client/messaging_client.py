@@ -32,7 +32,6 @@ USER_ID = os.getenv(
     "USER_ID", "pearl@easyspeak-aac.com"
 )  # Replace with your actual user ID or email
 POLL_INTERVAL = 5  # Seconds between polling requests
-MAX_POLLS = 60  # Maximum number of polls before timing out
 
 # Initialize Socket.IO client
 sio = socketio.Client()
@@ -72,71 +71,208 @@ def initialize_selenium():
     driver = webdriver.Chrome(options=chrome_options)
     return driver
 
-def detect_new_message(driver, last_message_id):
+def find_last_message_from_me(driver):
     """
-    Detects the latest message in Slack.
+    Finds the last message sent by 'me' in Slack.
 
     Args:
         driver: Selenium WebDriver instance.
-        last_message_id: The ID of the last processed message.
 
     Returns:
-        Tuple (message_id, content, timestamp) or (None, None, None) if no new message.
+        last_message_from_me_id: The message ID (timestamp) of the last message sent by 'me'.
     """
     try:
         # Locate message elements
         messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
-        if not messages:
-            return (None, None, None)
 
-        # Assume the last message is the latest
-        latest_message = messages[-1]
-
-        # Extract message ID (timestamp)
-        try:
-            timestamp_element = latest_message.find_element(By.CSS_SELECTOR, "a.c-timestamp")
-            message_id = timestamp_element.get_attribute("data-ts")
-            # Convert timestamp to integer (milliseconds since epoch)
-            ts_float = float(message_id)
-            timestamp = int(ts_float * 1000)
-        except NoSuchElementException:
-            message_id = str(uuid.uuid4())  # Fallback to UUID if timestamp not found
-            timestamp = None
-
-        # Check if this message has been processed
-        if message_id == last_message_id:
-            return (None, None, None)
-
-        # Extract sender name
-        try:
-            sender_element = latest_message.find_element(By.CSS_SELECTOR, "button.c-message__sender_button")
-            sender_name = sender_element.text.strip()
-        except NoSuchElementException:
+        for message in reversed(messages):  # Start from oldest to newest
+            # Extract sender name
             try:
-                sender_span = latest_message.find_element(
-                    By.CSS_SELECTOR, 'span.offscreen[data-qa^="aria-labelledby"]'
-                )
-                sender_name = sender_span.text.strip()
+                sender_element = message.find_element(By.CSS_SELECTOR, "button.c-message__sender_button")
+                sender_name = sender_element.text.strip()
             except NoSuchElementException:
-                sender_name = "Unknown"
+                try:
+                    sender_span = message.find_element(
+                        By.CSS_SELECTOR, 'span.offscreen[data-qa^="aria-labelledby"]'
+                    )
+                    sender_name = sender_span.text.strip()
+                except NoSuchElementException:
+                    sender_name = "Unknown"
 
-        # Extract message content
-        try:
-            message_text_element = latest_message.find_element(By.CSS_SELECTOR, "div.p-rich_text_section")
-            message_text = message_text_element.text.strip()
-        except NoSuchElementException:
-            message_text = ""
+            # Check if the sender is 'me'
+            if "pearl" in sender_name.lower():
+                # Extract message ID (timestamp)
+                try:
+                    timestamp_element = message.find_element(By.CSS_SELECTOR, "a.c-timestamp")
+                    message_id = timestamp_element.get_attribute("data-ts")
+                except NoSuchElementException:
+                    message_id = None
 
-        # Skip messages sent by self to prevent feedback loops
-        if "pearl" in sender_name.lower():
-            logger.debug(f"Skipping message from sender: {sender_name}")
-            return (None, None, None)
+                logger.info(f"Found last message from 'me' with ID: {message_id}")
+                return message_id
 
-        return (message_id, message_text, timestamp)
+        # If no message from 'me' is found
+        logger.info("No previous message from 'me' found.")
+        return None
 
     except Exception as e:
-        logger.exception("Error detecting new message.")
-        return (None, None, None)
+        logger.exception("Error finding last message from 'me'.")
+        return None
+
+def collect_messages_after(driver, last_message_from_me_id):
+    """
+    Collects messages after the message with the given message ID.
+
+    Args:
+        driver: Selenium WebDriver instance.
+        last_message_from_me_id: The message ID (timestamp) of the last message sent by 'me'.
+
+    Returns:
+        messages_list: A list of messages (dictionaries) sent after last_message_from_me_id.
+    """
+    try:
+        # Locate message elements
+        messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
+        messages_list = []
+
+        # Flag to start collecting messages
+        collecting = False
+
+        # Go through messages from oldest to newest
+        for message in messages:
+            # Extract message ID (timestamp)
+            try:
+                timestamp_element = message.find_element(By.CSS_SELECTOR, "a.c-timestamp")
+                message_id = timestamp_element.get_attribute("data-ts")
+            except NoSuchElementException:
+                message_id = str(uuid.uuid4())  # Fallback to UUID if timestamp not found
+
+            # If we have reached the last message from 'me', start collecting
+            if last_message_from_me_id and message_id == last_message_from_me_id:
+                collecting = True
+                continue  # Skip the message from 'me'
+
+            if collecting or last_message_from_me_id is None:
+                # Extract sender name
+                try:
+                    sender_element = message.find_element(By.CSS_SELECTOR, "button.c-message__sender_button")
+                    sender_name = sender_element.text.strip()
+                except NoSuchElementException:
+                    try:
+                        sender_span = message.find_element(
+                            By.CSS_SELECTOR, 'span.offscreen[data-qa^="aria-labelledby"]'
+                        )
+                        sender_name = sender_span.text.strip()
+                    except NoSuchElementException:
+                        sender_name = "Unknown"
+
+                # Extract message content
+                try:
+                    message_text_element = message.find_element(By.CSS_SELECTOR, "div.p-rich_text_section")
+                    message_text = message_text_element.text.strip()
+                except NoSuchElementException:
+                    message_text = ""
+
+                # Extract timestamp
+                try:
+                    ts_float = float(message_id)
+                    timestamp = int(ts_float * 1000)
+                except ValueError:
+                    timestamp = None
+
+                # Skip messages sent by 'me' to prevent feedback loops
+                if "pearl" in sender_name.lower():
+                    continue
+
+                # Add message to the list
+                messages_list.append({
+                    'message_id': message_id,
+                    'content': message_text,
+                    'timestamp': timestamp,
+                })
+
+        return messages_list
+
+    except Exception as e:
+        logger.exception("Error collecting messages after last message from 'me'.")
+        return []
+
+def detect_new_messages(driver, last_processed_ts_float):
+    """
+    Detects new messages in Slack after the last processed message timestamp.
+
+    Args:
+        driver: Selenium WebDriver instance.
+        last_processed_ts_float: The timestamp of the last processed message as float.
+
+    Returns:
+        new_messages: A list of new messages (dictionaries) after last_processed_ts_float.
+    """
+    try:
+        # Locate message elements
+        messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
+        new_messages = []
+
+        # Go through messages from oldest to newest
+        for message in messages:
+            # Extract message ID (timestamp)
+            try:
+                timestamp_element = message.find_element(By.CSS_SELECTOR, "a.c-timestamp")
+                message_id = timestamp_element.get_attribute("data-ts")
+                message_ts_float = float(message_id)
+            except (NoSuchElementException, ValueError):
+                message_id = str(uuid.uuid4())  # Fallback to UUID if timestamp not found
+                message_ts_float = None
+
+            # Skip messages before last_processed_ts_float
+            if last_processed_ts_float is not None and message_ts_float is not None:
+                if message_ts_float <= last_processed_ts_float:
+                    continue
+
+            # Extract sender name
+            try:
+                sender_element = message.find_element(By.CSS_SELECTOR, "button.c-message__sender_button")
+                sender_name = sender_element.text.strip()
+            except NoSuchElementException:
+                try:
+                    sender_span = message.find_element(
+                        By.CSS_SELECTOR, 'span.offscreen[data-qa^="aria-labelledby"]'
+                    )
+                    sender_name = sender_span.text.strip()
+                except NoSuchElementException:
+                    sender_name = "Unknown"
+
+            # Extract message content
+            try:
+                message_text_element = message.find_element(By.CSS_SELECTOR, "div.p-rich_text_section")
+                message_text = message_text_element.text.strip()
+            except NoSuchElementException:
+                message_text = ""
+
+            # Extract timestamp
+            if message_ts_float is not None:
+                timestamp = int(message_ts_float * 1000)
+            else:
+                timestamp = None
+
+            # Skip messages sent by 'me' to prevent feedback loops
+            if "pearl" in sender_name.lower():
+                continue
+
+            # Add message to the list
+            new_messages.append({
+                'message_id': message_id,
+                'content': message_text,
+                'timestamp': timestamp,
+            })
+
+        # Return new messages sorted by timestamp
+        new_messages.sort(key=lambda x: float(x['message_id']))
+        return new_messages
+
+    except Exception as e:
+        logger.exception("Error detecting new messages.")
+        return []
 
 def send_message_via_websocket(content, timestamp):
     """
@@ -245,18 +381,45 @@ def messaging_client():
     driver = initialize_selenium()
     logger.info("Selenium WebDriver initialized and connected to Chrome.")
 
-    # Initialize last_message_id
-    last_message_id = None
+    # Initialize last_message_from_me_id
+    last_message_from_me_id = find_last_message_from_me(driver)
 
+    # Initialize last_processed_ts_float
+    last_processed_ts_float = None
+
+    # Collect messages after last message from 'me'
+    messages_to_process = collect_messages_after(driver, last_message_from_me_id)
+
+    # Process messages in chronological order
+    for message in messages_to_process:
+        message_id = message['message_id']
+        content = message['content']
+        timestamp = message['timestamp']
+
+        logger.info(f'Processing message: "{content}" at {timestamp} (ID: {message_id})')
+        # Send the message to the back end via WebSocket
+        send_message_via_websocket(content, timestamp)
+
+        # Update the last_processed_ts_float
+        last_processed_ts_float = float(message_id)
+
+    # Main loop
     while running:
         try:
-            message_id, content, timestamp = detect_new_message(driver, last_message_id)
-            if message_id and content:
-                logger.info(f'New message detected: "{content}" at {timestamp} (ID: {message_id})')
-                # Send the message to the back end via WebSocket
-                send_message_via_websocket(content, timestamp)
-                # Update the last_message_id
-                last_message_id = message_id
+            # Detect new messages after last_processed_ts_float
+            new_messages = detect_new_messages(driver, last_processed_ts_float)
+            if new_messages:
+                for message in new_messages:
+                    message_id = message['message_id']
+                    content = message['content']
+                    timestamp = message['timestamp']
+
+                    logger.info(f'New message detected: "{content}" at {timestamp} (ID: {message_id})')
+                    # Send the message to the back end via WebSocket
+                    send_message_via_websocket(content, timestamp)
+
+                    # Update the last_processed_ts_float
+                    last_processed_ts_float = float(message_id)
             else:
                 logger.debug("No new messages detected.")
         except Exception as e:
