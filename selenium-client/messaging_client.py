@@ -18,7 +18,8 @@ import logging
 import signal
 import sys
 import uuid
-import datetime  # For timestamp conversion
+import hmac
+import hashlib
 
 # Setup Logging
 logging.basicConfig(
@@ -31,6 +32,7 @@ WEBSOCKET_SERVER_URL = os.getenv("WEBSOCKET_SERVER_URL", "http://localhost:3000"
 USER_ID = os.getenv(
     "USER_ID", "pearl@easyspeak-aac.com"
 )  # Replace with your actual user ID or email
+PEPPER = os.getenv('PEPPER', 'SuperSecretPepperValue')  # Securely store this in production
 POLL_INTERVAL = 5  # Seconds between polling requests
 
 # Initialize Socket.IO client
@@ -119,6 +121,39 @@ def find_last_message_from_me(driver):
         logger.exception("Error finding last message from 'me'.")
         return None
 
+def derive_salt(sender_name, pepper):
+    """
+    Derives a deterministic salt based on the sender's name and a secret pepper.
+
+    Args:
+        sender_name (str): The sender's name.
+        pepper (str): The secret pepper.
+
+    Returns:
+        bytes: A 16-byte salt derived from the sender's name and pepper.
+    """
+    return hmac.new(
+        key=pepper.encode('utf-8'),
+        msg=sender_name.encode('utf-8'),
+        digestmod=hashlib.sha256
+    ).digest()[:16]  # Use the first 16 bytes as the salt
+
+def hash_sender_name(sender_name, salt, pepper):
+    """
+    Hashes the sender's name using SHA-256 with a derived salt and pepper.
+
+    Args:
+        sender_name (str): The sender's name.
+        salt (bytes): The salt derived from the sender's name.
+        pepper (str): The secret pepper.
+
+    Returns:
+        str: The hexadecimal digest of the hashed sender's name.
+    """
+    hasher = hashlib.sha256()
+    hasher.update(sender_name.encode('utf-8') + salt + pepper.encode('utf-8'))
+    return hasher.hexdigest()
+
 def collect_messages_after(driver, last_message_from_me_id):
     """
     Collects messages after the message with the given message ID.
@@ -184,11 +219,18 @@ def collect_messages_after(driver, last_message_from_me_id):
                 if "pearl" in sender_name.lower():
                     continue
 
+                # Derive the salt for this sender
+                salt = derive_salt(sender_name, PEPPER)
+
+                # Hash the sender's name
+                hashed_sender_name = hash_sender_name(sender_name, salt, PEPPER)
+
                 # Add message to the list
                 messages_list.append({
                     'message_id': message_id,
                     'content': message_text,
                     'timestamp': timestamp,
+                    'hashed_sender_name': hashed_sender_name,
                 })
 
         return messages_list
@@ -259,11 +301,18 @@ def detect_new_messages(driver, last_processed_ts_float):
             if "pearl" in sender_name.lower():
                 continue
 
+            # Derive the salt for this sender
+            salt = derive_salt(sender_name, PEPPER)
+
+            # Hash the sender's name
+            hashed_sender_name = hash_sender_name(sender_name, salt, PEPPER)
+
             # Add message to the list
             new_messages.append({
                 'message_id': message_id,
                 'content': message_text,
                 'timestamp': timestamp,
+                'hashed_sender_name': hashed_sender_name,
             })
 
         # Return new messages sorted by timestamp
@@ -274,19 +323,25 @@ def detect_new_messages(driver, last_processed_ts_float):
         logger.exception("Error detecting new messages.")
         return []
 
-def send_message_via_websocket(content, timestamp):
+def send_message_via_websocket(content, timestamp, hashed_sender_name):
     """
     Sends the new message to the back end via WebSocket.
 
     Args:
         content (str): The content of the message.
         timestamp (int): The timestamp of the message in milliseconds since epoch.
+        hashed_sender_name (str): The hashed sender's name.
     """
     try:
-        # Send the content and timestamp of the message
+        # Send the content, timestamp, and hashed sender's name
         sio.emit(
             "newMessage",
-            {"content": content, "timestamp": timestamp, "user_id": USER_ID},
+            {
+                "content": content,
+                "timestamp": timestamp,
+                "user_id": USER_ID,
+                "hashed_sender_name": hashed_sender_name,
+            },
             namespace="/messaging",
         )
         logger.info(f'Sent message via WebSocket: "{content}" at {timestamp}')
@@ -395,10 +450,11 @@ def messaging_client():
         message_id = message['message_id']
         content = message['content']
         timestamp = message['timestamp']
+        hashed_sender_name = message['hashed_sender_name']
 
         logger.info(f'Processing message: "{content}" at {timestamp} (ID: {message_id})')
         # Send the message to the back end via WebSocket
-        send_message_via_websocket(content, timestamp)
+        send_message_via_websocket(content, timestamp, hashed_sender_name)
 
         # Update the last_processed_ts_float
         last_processed_ts_float = float(message_id)
@@ -413,10 +469,12 @@ def messaging_client():
                     message_id = message['message_id']
                     content = message['content']
                     timestamp = message['timestamp']
+                    hashed_sender_name = message['hashed_sender_name']
 
                     logger.info(f'New message detected: "{content}" at {timestamp} (ID: {message_id})')
+
                     # Send the message to the back end via WebSocket
-                    send_message_via_websocket(content, timestamp)
+                    send_message_via_websocket(content, timestamp, hashed_sender_name)
 
                     # Update the last_processed_ts_float
                     last_processed_ts_float = float(message_id)
