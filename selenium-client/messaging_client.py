@@ -18,6 +18,7 @@ import sys
 import uuid
 import hmac
 import hashlib
+import urllib.parse  # For parsing URLs
 
 # Setup Logging
 logging.basicConfig(
@@ -156,33 +157,31 @@ def find_last_message_from_me(driver):
     """
     Finds the last message sent by 'me' (pearl) in Slack.
 
-    Args:
-        driver: Selenium WebDriver instance.
-
     Returns:
-        last_message_from_me_id: The message ID (timestamp) of the last message sent by 'me'.
+        last_message_from_me_ts_float: The timestamp (as float) of the last message sent by 'me'.
     """
     try:
         # Locate message elements
         messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
-        logger.info(f"Found {len(messages)} messages in the chat.")
 
         # Go through messages from newest to oldest
         for message in reversed(messages):
             # Extract sender name
             sender_name = extract_sender_name(message)
-            logger.info(f"Sender: {sender_name}")
+
             # Check if the sender is 'me'
             if "pearl" in sender_name.lower():
                 # Extract message ID (timestamp)
                 try:
                     timestamp_element = message.find_element(By.CSS_SELECTOR, "a.c-timestamp")
                     message_id = timestamp_element.get_attribute("data-ts")
-                except NoSuchElementException:
+                    message_ts_float = float(message_id)
+                except (NoSuchElementException, ValueError):
                     message_id = None
+                    message_ts_float = None
 
                 logger.info(f"Found last message from 'me' with ID: {message_id}")
-                return message_id
+                return message_ts_float
 
         # If no message from 'me' is found
         logger.info("No previous message from 'me' found.")
@@ -192,12 +191,11 @@ def find_last_message_from_me(driver):
         logger.exception("Error finding last message from 'me'.")
         return None
 
-def collect_messages_from_elements(messages, last_message_from_me_id):
+def collect_messages_from_elements(messages, last_message_from_me_ts_float):
     """
-    Collect messages from given message elements, up to the last message from 'me'.
+    Collect messages sent after the last message from 'me', based on timestamps.
     """
     messages_list = []
-    collecting = False if last_message_from_me_id else True
 
     # Go through messages from oldest to newest
     for message in messages:
@@ -205,39 +203,38 @@ def collect_messages_from_elements(messages, last_message_from_me_id):
         try:
             timestamp_element = message.find_element(By.CSS_SELECTOR, "a.c-timestamp")
             message_id = timestamp_element.get_attribute("data-ts")
-        except NoSuchElementException:
+            message_ts_float = float(message_id)
+        except (NoSuchElementException, ValueError):
             message_id = str(uuid.uuid4())  # Fallback to UUID if timestamp not found
+            message_ts_float = None
 
-        # If we have reached the last message from 'me', stop collecting
-        if last_message_from_me_id and message_id == last_message_from_me_id:
-            collecting = False
-            continue  # Skip the message from 'me'
-
-        if collecting or last_message_from_me_id is None:
-            # Extract sender name
-            sender_name = extract_sender_name(message)
-            # Extract message content
-            message_text = extract_message_text(message)
-            # Extract timestamp
-            timestamp = extract_timestamp(message_id)
-            # Skip messages sent by 'me' to prevent feedback loops
-            if "pearl" in sender_name.lower():
+        # Collect messages with timestamps greater than last_message_from_me_ts_float
+        if last_message_from_me_ts_float is not None and message_ts_float is not None:
+            if message_ts_float <= last_message_from_me_ts_float:
                 continue
-            # Hash the sender's name
-            hashed_sender_name = hash_sender_name_with_salt(sender_name)
-            # Add message to the list
-            messages_list.append({
-                'message_id': message_id,
-                'content': message_text,
-                'timestamp': timestamp,
-                'hashed_sender_name': hashed_sender_name,
-            })
-        else:
-            collecting = True  # Start collecting after last_message_from_me_id
+
+        # Extract sender name
+        sender_name = extract_sender_name(message)
+        # Skip messages sent by 'me' to prevent feedback loops
+        if "pearl" in sender_name.lower():
+            continue
+        # Extract message content
+        message_text = extract_message_text(message)
+        # Extract timestamp
+        timestamp = extract_timestamp(message_id)
+        # Hash the sender's name
+        hashed_sender_name = hash_sender_name_with_salt(sender_name)
+        # Add message to the list
+        messages_list.append({
+            'message_id': message_id,
+            'content': message_text,
+            'timestamp': timestamp,
+            'hashed_sender_name': hashed_sender_name,
+        })
 
     return messages_list
 
-def collect_messages_after(driver, last_message_from_me_id):
+def collect_messages_after(driver, last_message_from_me_ts_float):
     """
     Collects messages based on the current context: DM, channel, or thread.
     """
@@ -251,12 +248,12 @@ def collect_messages_after(driver, last_message_from_me_id):
             logger.info("Thread is open. Collecting messages from thread.")
             # Collect messages in the thread
             messages = driver.find_elements(By.CSS_SELECTOR, "div.c-virtual_list__item--message_thread div.c-message_kit__background")
-            messages_list = collect_messages_from_elements(messages, last_message_from_me_id)
+            messages_list = collect_messages_from_elements(messages, last_message_from_me_ts_float)
         elif in_dm:
-            logger.info("In a DM. Collecting messages up to last message from 'me'.")
+            logger.info("In a DM. Collecting messages sent after last message from 'me'.")
             # Collect messages in the DM
             messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
-            messages_list = collect_messages_from_elements(messages, last_message_from_me_id)
+            messages_list = collect_messages_from_elements(messages, last_message_from_me_ts_float)
         else:
             logger.info("In a channel. Collecting only the most recent message.")
             # Collect only the most recent message in the channel
@@ -291,20 +288,20 @@ def detect_new_messages_from_elements(messages, last_processed_ts_float):
             message_id = str(uuid.uuid4())  # Fallback to UUID if timestamp not found
             message_ts_float = None
 
-        # Skip messages before last_processed_ts_float
+        # Skip messages before or equal to last_processed_ts_float
         if last_processed_ts_float is not None and message_ts_float is not None:
             if message_ts_float <= last_processed_ts_float:
                 continue
 
         # Extract sender name
         sender_name = extract_sender_name(message)
+        # Skip messages sent by 'me' to prevent feedback loops
+        if "pearl" in sender_name.lower():
+            continue
         # Extract message content
         message_text = extract_message_text(message)
         # Extract timestamp
         timestamp = extract_timestamp(message_id)
-        # Skip messages sent by 'me' to prevent feedback loops
-        # if "pearl" in sender_name.lower():
-        #     continue
         # Hash the sender's name
         hashed_sender_name = hash_sender_name_with_salt(sender_name)
         # Add message to the list
@@ -444,6 +441,31 @@ def on_send_selected_response(data):
     else:
         logger.error("Received sendSelectedResponse event without selected_response")
 
+def get_current_chat_id(driver):
+    """
+    Returns a unique identifier for the current chat, based on the URL.
+    """
+    try:
+        current_url = driver.current_url
+        parsed_url = urllib.parse.urlparse(current_url)
+        channel_id = urllib.parse.parse_qs(parsed_url.query).get('channel', [None])[0]
+
+        if channel_id:
+            logger.info(f"Current chat ID: {channel_id}")
+            return channel_id
+        else:
+            # Fallback: Use the path
+            path = parsed_url.path
+            if path:
+                logger.info(f"Current chat path: {path}")
+                return path
+            else:
+                logger.warning("Unable to determine current chat ID.")
+                return None
+    except Exception as e:
+        logger.exception("Error getting current chat ID.")
+        return None
+
 def messaging_client():
     global driver
 
@@ -459,14 +481,15 @@ def messaging_client():
     driver = initialize_selenium()
     logger.info("Selenium WebDriver initialized and connected to Chrome.")
 
-    # Initialize last_message_from_me_id
-    last_message_from_me_id = find_last_message_from_me(driver)
+    # Get initial chat ID
+    previous_chat_id = get_current_chat_id(driver)
 
-    # Initialize last_processed_ts_float
-    last_processed_ts_float = None
+    # Initialize last_message_from_me_ts_float and last_processed_ts_float
+    last_message_from_me_ts_float = find_last_message_from_me(driver)
+    last_processed_ts_float = last_message_from_me_ts_float
 
     # Collect messages after last message from 'me'
-    messages_to_process = collect_messages_after(driver, last_message_from_me_id)
+    messages_to_process = collect_messages_after(driver, last_message_from_me_ts_float)
 
     # Process messages in chronological order
     for message in messages_to_process:
@@ -485,24 +508,52 @@ def messaging_client():
     # Main loop
     while running:
         try:
-            # Detect new messages after last_processed_ts_float
-            new_messages = detect_new_messages(driver, last_processed_ts_float)
-            if new_messages:
-                for message in new_messages:
+            # Check if the chat has changed
+            current_chat_id = get_current_chat_id(driver)
+            if current_chat_id != previous_chat_id:
+                logger.info(f"Chat changed from {previous_chat_id} to {current_chat_id}. Resetting state.")
+                previous_chat_id = current_chat_id
+
+                # Reset state variables
+                last_message_from_me_ts_float = find_last_message_from_me(driver)
+                last_processed_ts_float = last_message_from_me_ts_float
+
+                # Collect messages after last message from 'me'
+                messages_to_process = collect_messages_after(driver, last_message_from_me_ts_float)
+
+                # Process messages in chronological order
+                for message in messages_to_process:
                     message_id = message['message_id']
                     content = message['content']
                     timestamp = message['timestamp']
                     hashed_sender_name = message['hashed_sender_name']
 
-                    logger.info(f'New message detected: "{content}" at {timestamp} (ID: {message_id})')
-
+                    logger.info(f'Processing message: "{content}" at {timestamp} (ID: {message_id})')
                     # Send the message to the back end via WebSocket
                     send_message_via_websocket(content, timestamp, hashed_sender_name)
 
                     # Update the last_processed_ts_float
                     last_processed_ts_float = float(message_id)
             else:
-                logger.debug("No new messages detected.")
+                # Detect new messages after last_processed_ts_float
+                new_messages = detect_new_messages(driver, last_processed_ts_float)
+                if new_messages:
+                    for message in new_messages:
+                        message_id = message['message_id']
+                        content = message['content']
+                        timestamp = message['timestamp']
+                        hashed_sender_name = message['hashed_sender_name']
+
+                        logger.info(f'New message detected: "{content}" at {timestamp} (ID: {message_id})')
+
+                        # Send the message to the back end via WebSocket
+                        send_message_via_websocket(content, timestamp, hashed_sender_name)
+
+                        # Update the last_processed_ts_float
+                        last_processed_ts_float = float(message_id)
+                else:
+                    logger.debug("No new messages detected.")
+
         except Exception as e:
             logger.exception("Error in main loop.")
 
