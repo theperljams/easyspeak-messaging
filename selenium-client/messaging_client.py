@@ -90,11 +90,15 @@ def is_dm(driver):
 
 def is_thread_open(driver):
     """
-    Determines if a thread is open by checking for thread-specific elements.
+    Determines if a thread is open by checking for the presence of the thread pane.
     """
     try:
-        driver.find_element(By.CSS_SELECTOR, 'div.p-threads_view__default_background')
-        return True
+        # Adjust the selector based on Slack's current HTML structure
+        thread_pane = driver.find_element(By.CSS_SELECTOR, 'div.p-threads_view')
+        if thread_pane.is_displayed():
+            return True
+        else:
+            return False
     except NoSuchElementException:
         return False
 
@@ -118,21 +122,33 @@ def hash_sender_name(sender_name, salt, pepper):
 
 def extract_sender_name(message):
     try:
-        sender_element = message.find_element(By.CSS_SELECTOR, "button.c-message__sender_button")
+        # Try to find the sender name in different possible elements
+        # 1. Sender link (common for channels)
+        sender_element = message.find_element(By.CSS_SELECTOR, "a.c-message__sender_link")
         sender_name = sender_element.text.strip()
     except NoSuchElementException:
         try:
-            sender_span = message.find_element(
-                By.CSS_SELECTOR, 'span.offscreen[data-qa^="aria-labelledby"]'
-            )
-            sender_name = sender_span.text.strip()
+            # 2. Sender button (used in threads or certain messages)
+            sender_element = message.find_element(By.CSS_SELECTOR, "button.c-message__sender_button")
+            sender_name = sender_element.text.strip()
         except NoSuchElementException:
-            sender_name = "Unknown"
+            try:
+                # 3. Span with class 'c-message__sender'
+                sender_element = message.find_element(By.CSS_SELECTOR, "span.c-message__sender")
+                sender_name = sender_element.text.strip()
+            except NoSuchElementException:
+                try:
+                    # 4. Span with class 'offscreen' and specific data-qa attribute
+                    sender_element = message.find_element(By.CSS_SELECTOR, "span.offscreen[data-qa^='aria-labelledby']")
+                    sender_name = sender_element.text.strip()
+                except NoSuchElementException:
+                    sender_name = "Unknown"
     return sender_name
+
 
 def extract_message_text(message):
     try:
-        message_text_element = message.find_element(By.CSS_SELECTOR, "div.p-rich_text_section")
+        message_text_element = message.find_element(By.CSS_SELECTOR, "div.c-message_kit__blocks")
         message_text = message_text_element.text.strip()
     except NoSuchElementException:
         message_text = ""
@@ -156,7 +172,6 @@ def hash_sender_name_with_salt(sender_name):
 def find_last_message_from_me(driver):
     """
     Finds the last message sent by 'me' (pearl) in Slack.
-
     Returns:
         last_message_from_me_ts_float: The timestamp (as float) of the last message sent by 'me'.
     """
@@ -166,9 +181,10 @@ def find_last_message_from_me(driver):
 
         # Go through messages from newest to oldest
         for message in reversed(messages):
+            logger.info(f"Message: {extract_message_text(message)}")
             # Extract sender name
             sender_name = extract_sender_name(message)
-
+            logger.info(f"Sender name: {sender_name}")
             # Check if the sender is 'me'
             if "pearl" in sender_name.lower():
                 # Extract message ID (timestamp)
@@ -191,9 +207,46 @@ def find_last_message_from_me(driver):
         logger.exception("Error finding last message from 'me'.")
         return None
 
-def collect_messages_from_elements(messages, last_message_from_me_ts_float):
+def find_last_message_from_me_in_thread(driver):
     """
-    Collect messages sent after the last message from 'me', based on timestamps.
+    Finds the last message sent by 'me' (pearl) in the current thread.
+    Returns:
+        last_message_from_me_ts_float: The timestamp (as float) of the last message sent by 'me' in the thread.
+    """
+    try:
+        # Locate message elements in the thread
+        messages = driver.find_elements(By.CSS_SELECTOR, "div.c-virtual_list__item--thread div.c-message_kit__background")
+
+        # Go through messages from newest to oldest
+        for message in reversed(messages):
+            # Extract sender name
+            sender_name = extract_sender_name(message)
+
+            # Check if the sender is 'me'
+            if "pearl" in sender_name.lower():
+                # Extract message ID (timestamp)
+                try:
+                    timestamp_element = message.find_element(By.CSS_SELECTOR, "a.c-timestamp")
+                    message_id = timestamp_element.get_attribute("data-ts")
+                    message_ts_float = float(message_id)
+                except (NoSuchElementException, ValueError):
+                    message_id = None
+                    message_ts_float = None
+
+                logger.info(f"Found last message from 'me' in thread with ID: {message_id}")
+                return message_ts_float
+
+        # If no message from 'me' is found in the thread
+        logger.info("No previous message from 'me' found in thread.")
+        return None
+
+    except Exception as e:
+        logger.exception("Error finding last message from 'me' in thread.")
+        return None
+
+def collect_messages_from_elements(messages, last_message_from_me_ts_float, last_message_from_me_ts_float_in_thread=None):
+    """
+    Collect messages sent after the last message from 'me' (or up to last message from 'me' in thread), based on timestamps.
     """
     messages_list = []
 
@@ -208,7 +261,12 @@ def collect_messages_from_elements(messages, last_message_from_me_ts_float):
             message_id = str(uuid.uuid4())  # Fallback to UUID if timestamp not found
             message_ts_float = None
 
-        # Collect messages with timestamps greater than last_message_from_me_ts_float
+        # For threads, stop collecting if message_ts_float >= last_message_from_me_ts_float_in_thread
+        if last_message_from_me_ts_float_in_thread is not None and message_ts_float is not None:
+            if message_ts_float >= last_message_from_me_ts_float_in_thread:
+                break  # Stop collecting further messages
+
+        # For DMs, skip messages <= last_message_from_me_ts_float
         if last_message_from_me_ts_float is not None and message_ts_float is not None:
             if message_ts_float <= last_message_from_me_ts_float:
                 continue
@@ -245,25 +303,33 @@ def collect_messages_after(driver, last_message_from_me_ts_float):
         messages_list = []
 
         if thread_open:
-            logger.info("Thread is open. Collecting messages from thread.")
+            logger.info("Thread is open. Collecting messages in thread up to last message from 'me'.")
+            # Find the last message from 'me' in the thread
+            last_message_from_me_in_thread_ts_float = find_last_message_from_me_in_thread(driver)
+
             # Collect messages in the thread
-            messages = driver.find_elements(By.CSS_SELECTOR, "div.c-virtual_list__item--message_thread div.c-message_kit__background")
-            messages_list = collect_messages_from_elements(messages, last_message_from_me_ts_float)
+            messages = driver.find_elements(By.CSS_SELECTOR, "div.c-virtual_list__item--thread div.c-message_kit__background")
+
+            # Use the timestamp of the last message from 'me' in the thread
+            messages_list = collect_messages_from_elements(messages, None, last_message_from_me_in_thread_ts_float)
         elif in_dm:
-            logger.info("In a DM. Collecting messages sent after last message from 'me'.")
-            # Collect messages in the DM
-            messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
-            messages_list = collect_messages_from_elements(messages, last_message_from_me_ts_float)
-        else:
-            logger.info("In a channel. Collecting only the most recent message.")
-            # Collect only the most recent message in the channel
-            messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
-            if messages:
-                latest_message = messages[-1]
-                messages_list = collect_messages_from_elements([latest_message], None)
-            else:
-                logger.info("No messages found in channel.")
+            if last_message_from_me_ts_float is None:
+                logger.info("No previous message from 'me' found in DM. Not collecting any messages.")
                 messages_list = []
+            else:
+                logger.info("In a DM. Collecting messages sent after last message from 'me'.")
+                # Collect messages in the DM
+                messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
+                messages_list = collect_messages_from_elements(messages, last_message_from_me_ts_float)
+        else:
+            if last_message_from_me_ts_float is None:
+                logger.info("No previous message from 'me' found in channel. Not collecting any messages.")
+                messages_list = []
+            else:
+                logger.info("In a channel. Collecting messages sent after last message from 'me'.")
+                # Collect messages in the channel
+                messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
+                messages_list = collect_messages_from_elements(messages, last_message_from_me_ts_float)
 
         return messages_list
 
@@ -271,9 +337,55 @@ def collect_messages_after(driver, last_message_from_me_ts_float):
         logger.exception("Error collecting messages.")
         return []
 
-def detect_new_messages_from_elements(messages, last_processed_ts_float):
+def detect_new_messages(driver, last_processed_ts_float):
     """
-    Detects new messages from given message elements after last_processed_ts_float.
+    Detects new messages based on the current context: DM, channel, or thread.
+    """
+    try:
+        # Determine context
+        in_dm = is_dm(driver)
+        thread_open = is_thread_open(driver)
+        new_messages = []
+
+        if thread_open:
+            logger.info("Thread is open. Detecting new messages in thread up to last message from 'me'.")
+            # Find the last message from 'me' in the thread
+            last_message_from_me_in_thread_ts_float = find_last_message_from_me_in_thread(driver)
+
+            # Collect messages in the thread
+            messages = driver.find_elements(By.CSS_SELECTOR, "div.c-virtual_list__item--thread div.c-message_kit__background")
+
+            # Use the timestamp of the last message from 'me' in the thread
+            new_messages = detect_new_messages_from_elements(messages, last_processed_ts_float, last_message_from_me_in_thread_ts_float)
+        elif in_dm:
+            if last_processed_ts_float is None:
+                logger.info("No previous message from 'me' found in DM. Not detecting new messages.")
+                new_messages = []
+            else:
+                logger.info("In a DM. Detecting new messages.")
+                # Collect messages in the DM
+                messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
+                new_messages = detect_new_messages_from_elements(messages, last_processed_ts_float)
+        else:
+            if last_processed_ts_float is None:
+                logger.info("No previous message from 'me' found in channel. Not detecting new messages.")
+                new_messages = []
+            else:
+                logger.info("In a channel. Detecting new messages.")
+                # Collect messages in the channel
+                messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
+                new_messages = detect_new_messages_from_elements(messages, last_processed_ts_float)
+
+        return new_messages
+
+    except Exception as e:
+        logger.exception("Error detecting new messages.")
+        return []
+
+
+def detect_new_messages_from_elements(messages, last_processed_ts_float, last_message_from_me_ts_float_in_thread=None):
+    """
+    Detects new messages from given message elements after last_processed_ts_float and before last_message_from_me_ts_float_in_thread.
     """
     new_messages = []
 
@@ -287,6 +399,11 @@ def detect_new_messages_from_elements(messages, last_processed_ts_float):
         except (NoSuchElementException, ValueError):
             message_id = str(uuid.uuid4())  # Fallback to UUID if timestamp not found
             message_ts_float = None
+
+        # For threads, stop collecting if message_ts_float >= last_message_from_me_ts_float_in_thread
+        if last_message_from_me_ts_float_in_thread is not None and message_ts_float is not None:
+            if message_ts_float >= last_message_from_me_ts_float_in_thread:
+                break  # Stop collecting further messages
 
         # Skip messages before or equal to last_processed_ts_float
         if last_processed_ts_float is not None and message_ts_float is not None:
@@ -316,40 +433,6 @@ def detect_new_messages_from_elements(messages, last_processed_ts_float):
     new_messages.sort(key=lambda x: float(x['message_id']))
     return new_messages
 
-def detect_new_messages(driver, last_processed_ts_float):
-    """
-    Detects new messages based on the current context: DM, channel, or thread.
-    """
-    try:
-        # Determine context
-        in_dm = is_dm(driver)
-        thread_open = is_thread_open(driver)
-        new_messages = []
-
-        if thread_open:
-            logger.info("Thread is open. Detecting new messages in thread.")
-            # Collect messages in the thread
-            messages = driver.find_elements(By.CSS_SELECTOR, "div.c-virtual_list__item--message_thread div.c-message_kit__background")
-            new_messages = detect_new_messages_from_elements(messages, last_processed_ts_float)
-        elif in_dm:
-            logger.info("In a DM. Detecting new messages.")
-            # Collect messages in the DM
-            messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
-            new_messages = detect_new_messages_from_elements(messages, last_processed_ts_float)
-        else:
-            logger.info("In a channel. Detecting new messages.")
-            # Collect messages in the channel
-            messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
-            new_messages = detect_new_messages_from_elements(messages, last_processed_ts_float)
-            # Only keep the most recent message
-            if new_messages:
-                new_messages = [new_messages[-1]]
-
-        return new_messages
-
-    except Exception as e:
-        logger.exception("Error detecting new messages.")
-        return []
 
 def send_message_via_websocket(content, timestamp, hashed_sender_name):
     """
@@ -466,6 +549,23 @@ def get_current_chat_id(driver):
         logger.exception("Error getting current chat ID.")
         return None
 
+def notify_chat_changed(new_chat_id):
+    """
+    Emits a 'chatChanged' event to the back-end via WebSocket.
+    Args:
+        new_chat_id (str): The identifier of the new chat.
+    """
+    try:
+        # Emit the 'chatChanged' event to the backend's '/messaging' namespace
+        sio.emit(
+            "chatChanged",
+            {"new_chat_id": new_chat_id},
+            namespace="/messaging",
+        )
+        logger.info(f"Emitted 'chatChanged' event with new_chat_id: {new_chat_id}")
+    except Exception as e:
+        logger.exception("Failed to emit 'chatChanged' event.")
+
 def messaging_client():
     global driver
 
@@ -481,17 +581,29 @@ def messaging_client():
     driver = initialize_selenium()
     logger.info("Selenium WebDriver initialized and connected to Chrome.")
 
-    # Get initial chat ID
+    # Get initial chat ID and thread state
     previous_chat_id = get_current_chat_id(driver)
+    previous_thread_open = is_thread_open(driver)
 
     # Initialize last_message_from_me_ts_float and last_processed_ts_float
     last_message_from_me_ts_float = find_last_message_from_me(driver)
     last_processed_ts_float = last_message_from_me_ts_float
 
     # Collect messages after last message from 'me'
-    messages_to_process = collect_messages_after(driver, last_message_from_me_ts_float)
+    if previous_thread_open:
+        # For thread, find last message from 'me' in thread
+        last_message_from_me_in_thread_ts_float = find_last_message_from_me_in_thread(driver)
+        messages_to_process = collect_messages_after(driver, None)
+        # Update last_processed_ts_float
+        if messages_to_process:
+            last_processed_ts_float = float(messages_to_process[-1]['message_id'])
+    else:
+        messages_to_process = collect_messages_after(driver, last_message_from_me_ts_float)
+        # Update last_processed_ts_float
+        if messages_to_process:
+            last_processed_ts_float = float(messages_to_process[-1]['message_id'])
 
-    # Process messages in chronological order
+    # Process messages
     for message in messages_to_process:
         message_id = message['message_id']
         content = message['content']
@@ -502,26 +614,39 @@ def messaging_client():
         # Send the message to the back end via WebSocket
         send_message_via_websocket(content, timestamp, hashed_sender_name)
 
-        # Update the last_processed_ts_float
-        last_processed_ts_float = float(message_id)
-
     # Main loop
     while running:
         try:
-            # Check if the chat has changed
+            # Check current chat ID and thread state
             current_chat_id = get_current_chat_id(driver)
-            if current_chat_id != previous_chat_id:
-                logger.info(f"Chat changed from {previous_chat_id} to {current_chat_id}. Resetting state.")
+            current_thread_open = is_thread_open(driver)
+
+            # If chat ID or thread state has changed, reset state
+            if current_chat_id != previous_chat_id or current_thread_open != previous_thread_open:
+                logger.info(f"Chat or thread state changed. Resetting state.")
                 previous_chat_id = current_chat_id
+
+                # Emit the 'chatChanged' event to notify the back-end
+                notify_chat_changed(current_chat_id)
 
                 # Reset state variables
                 last_message_from_me_ts_float = find_last_message_from_me(driver)
                 last_processed_ts_float = last_message_from_me_ts_float
 
                 # Collect messages after last message from 'me'
-                messages_to_process = collect_messages_after(driver, last_message_from_me_ts_float)
+                if current_thread_open:
+                    last_message_from_me_in_thread_ts_float = find_last_message_from_me_in_thread(driver)
+                    messages_to_process = collect_messages_after(driver, None)
+                    # Update last_processed_ts_float
+                    if messages_to_process:
+                        last_processed_ts_float = float(messages_to_process[-1]['message_id'])
+                else:
+                    messages_to_process = collect_messages_after(driver, last_message_from_me_ts_float)
+                    # Update last_processed_ts_float
+                    if messages_to_process:
+                        last_processed_ts_float = float(messages_to_process[-1]['message_id'])
 
-                # Process messages in chronological order
+                # Process messages
                 for message in messages_to_process:
                     message_id = message['message_id']
                     content = message['content']
@@ -531,9 +656,6 @@ def messaging_client():
                     logger.info(f'Processing message: "{content}" at {timestamp} (ID: {message_id})')
                     # Send the message to the back end via WebSocket
                     send_message_via_websocket(content, timestamp, hashed_sender_name)
-
-                    # Update the last_processed_ts_float
-                    last_processed_ts_float = float(message_id)
             else:
                 # Detect new messages after last_processed_ts_float
                 new_messages = detect_new_messages(driver, last_processed_ts_float)
@@ -554,11 +676,15 @@ def messaging_client():
                 else:
                     logger.debug("No new messages detected.")
 
+            # Update previous_thread_open
+            previous_thread_open = current_thread_open
+
         except Exception as e:
             logger.exception("Error in main loop.")
 
         # Poll every POLL_INTERVAL seconds
         time.sleep(POLL_INTERVAL)
+
 
 if __name__ == "__main__":
     try:
