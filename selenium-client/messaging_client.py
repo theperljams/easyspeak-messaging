@@ -121,28 +121,43 @@ def hash_sender_name(sender_name, salt, pepper):
     return hasher.hexdigest()
 
 def extract_sender_name(message):
-    try:
-        # Try to find the sender name in different possible elements
-        # 1. Sender link (common for channels)
-        sender_element = message.find_element(By.CSS_SELECTOR, "a.c-message__sender_link")
-        sender_name = sender_element.text.strip()
-    except NoSuchElementException:
+    sender_name = "Unknown"
+
+    possible_selectors = [
+        "a.c-message__sender_link",
+        "button.c-message__sender_button",
+        "span.c-message__sender",
+        "span.offscreen[data-qa^='aria-labelledby']",
+    ]
+
+    for selector in possible_selectors:
         try:
-            # 2. Sender button (used in threads or certain messages)
-            sender_element = message.find_element(By.CSS_SELECTOR, "button.c-message__sender_button")
+            sender_element = message.find_element(By.CSS_SELECTOR, selector)
             sender_name = sender_element.text.strip()
+            break
         except NoSuchElementException:
-            try:
-                # 3. Span with class 'c-message__sender'
-                sender_element = message.find_element(By.CSS_SELECTOR, "span.c-message__sender")
-                sender_name = sender_element.text.strip()
-            except NoSuchElementException:
-                try:
-                    # 4. Span with class 'offscreen' and specific data-qa attribute
-                    sender_element = message.find_element(By.CSS_SELECTOR, "span.offscreen[data-qa^='aria-labelledby']")
-                    sender_name = sender_element.text.strip()
-                except NoSuchElementException:
-                    sender_name = "Unknown"
+            continue
+
+    sender_name = normalize_sender_name(sender_name)
+
+    if sender_name == "Unknown":
+        logger.warning("Could not extract sender name for a message.")
+
+    return sender_name
+
+def normalize_sender_name(sender_name):
+    # Remove leading/trailing whitespace
+    sender_name = sender_name.strip()
+
+    # Convert to lowercase
+    sender_name = sender_name.lower()
+
+    # Replace multiple spaces with a single space
+    sender_name = ' '.join(sender_name.split())
+
+    # Remove zero-width spaces and other invisible characters if needed
+    # sender_name = sender_name.replace('\u200b', '')
+
     return sender_name
 
 
@@ -610,7 +625,7 @@ def messaging_client():
         timestamp = message['timestamp']
         hashed_sender_name = message['hashed_sender_name']
 
-        logger.info(f'Processing message: "{content}" at {timestamp} (ID: {message_id})')
+        logger.info(f'Processing message: "{content}" at {timestamp} (ID: {message_id}) from {hashed_sender_name}')
         # Send the message to the back end via WebSocket
         send_message_via_websocket(content, timestamp, hashed_sender_name)
 
