@@ -20,6 +20,9 @@ import hmac
 import hashlib
 import urllib.parse  # For parsing URLs
 
+from slack_client import SlackClient
+from instagram_client import InstagramClient
+
 # Setup Logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -72,14 +75,14 @@ def initialize_selenium():
     driver = webdriver.Chrome(options=chrome_options)
     return driver
 
-def is_dm(driver):
+def is_slack_dm(driver):
     """
     Determines if the current chat is a DM or a channel based on the aria-label attribute.
     """
     try:
         main_content = driver.find_element(By.CSS_SELECTOR, 'div.p-view_contents.p-view_contents--primary')
         aria_label = main_content.get_attribute('aria-label')
-        if aria_label:
+        if (aria_label):
             if "Conversation with" in aria_label:
                 return True
             elif "Channel" in aria_label:
@@ -88,7 +91,7 @@ def is_dm(driver):
     except NoSuchElementException:
         return False
 
-def is_thread_open(driver):
+def is_slack_thread_open(driver):
     """
     Determines if a thread is open by checking for the presence of the thread pane.
     """
@@ -120,7 +123,7 @@ def hash_sender_name(sender_name, salt, pepper):
     hasher.update(sender_name.encode('utf-8') + salt + pepper.encode('utf-8'))
     return hasher.hexdigest()
 
-def extract_sender_name(message):
+def slack_extract_sender_name(message):
     sender_name = "Unknown"
 
     possible_selectors = [
@@ -138,14 +141,14 @@ def extract_sender_name(message):
         except NoSuchElementException:
             continue
 
-    sender_name = normalize_sender_name(sender_name)
+    sender_name = slack_normalize_sender_name(sender_name)
 
     if sender_name == "Unknown":
         logger.warning("Could not extract sender name for a message.")
 
     return sender_name
 
-def normalize_sender_name(sender_name):
+def slack_normalize_sender_name(sender_name):
     # Remove leading/trailing whitespace
     sender_name = sender_name.strip()
 
@@ -161,7 +164,7 @@ def normalize_sender_name(sender_name):
     return sender_name
 
 
-def extract_message_text(message):
+def slack_extract_message_text(message):
     try:
         message_text_element = message.find_element(By.CSS_SELECTOR, "div.c-message_kit__blocks")
         message_text = message_text_element.text.strip()
@@ -169,7 +172,7 @@ def extract_message_text(message):
         message_text = ""
     return message_text
 
-def extract_timestamp(message_id):
+def slack_extract_timestamp(message_id):
     try:
         ts_float = float(message_id)
         timestamp = int(ts_float * 1000)
@@ -184,7 +187,7 @@ def hash_sender_name_with_salt(sender_name):
     hashed_sender_name = hash_sender_name(sender_name, salt, PEPPER)
     return hashed_sender_name
 
-def find_last_message_from_me(driver):
+def slack_find_last_message_from_me(driver):
     """
     Finds the last message sent by 'me' (pearl) in Slack.
     Returns:
@@ -196,9 +199,9 @@ def find_last_message_from_me(driver):
 
         # Go through messages from newest to oldest
         for message in reversed(messages):
-            logger.info(f"Message: {extract_message_text(message)}")
+            logger.info(f"Message: {slack_extract_message_text(message)}")
             # Extract sender name
-            sender_name = extract_sender_name(message)
+            sender_name = slack_extract_sender_name(message)
             logger.info(f"Sender name: {sender_name}")
             # Check if the sender is 'me'
             if "pearl" in sender_name.lower():
@@ -222,7 +225,7 @@ def find_last_message_from_me(driver):
         logger.exception("Error finding last message from 'me'.")
         return None
 
-def find_last_message_from_me_in_thread(driver):
+def slack_find_last_message_from_me_in_thread(driver):
     """
     Finds the last message sent by 'me' (pearl) in the current thread.
     Returns:
@@ -235,7 +238,7 @@ def find_last_message_from_me_in_thread(driver):
         # Go through messages from newest to oldest
         for message in reversed(messages):
             # Extract sender name
-            sender_name = extract_sender_name(message)
+            sender_name = slack_extract_sender_name(message)
 
             # Check if the sender is 'me'
             if "pearl" in sender_name.lower():
@@ -259,7 +262,7 @@ def find_last_message_from_me_in_thread(driver):
         logger.exception("Error finding last message from 'me' in thread.")
         return None
 
-def collect_messages_from_elements(messages, last_message_from_me_ts_float, last_message_from_me_ts_float_in_thread=None):
+def slack_collect_messages_from_elements(messages, last_message_from_me_ts_float, last_message_from_me_ts_float_in_thread=None):
     """
     Collect messages sent after the last message from 'me' (or up to last message from 'me' in thread), based on timestamps.
     """
@@ -287,14 +290,14 @@ def collect_messages_from_elements(messages, last_message_from_me_ts_float, last
                 continue
 
         # Extract sender name
-        sender_name = extract_sender_name(message)
+        sender_name = slack_extract_sender_name(message)
         # Skip messages sent by 'me' to prevent feedback loops
         if "pearl" in sender_name.lower():
             continue
         # Extract message content
-        message_text = extract_message_text(message)
+        message_text = slack_extract_message_text(message)
         # Extract timestamp
-        timestamp = extract_timestamp(message_id)
+        timestamp = slack_extract_timestamp(message_id)
         # Hash the sender's name
         hashed_sender_name = hash_sender_name_with_salt(sender_name)
         # Add message to the list
@@ -307,26 +310,26 @@ def collect_messages_from_elements(messages, last_message_from_me_ts_float, last
 
     return messages_list
 
-def collect_messages_after(driver, last_message_from_me_ts_float):
+def slack_collect_messages_after(driver, last_message_from_me_ts_float):
     """
     Collects messages based on the current context: DM, channel, or thread.
     """
     try:
         # Determine context
-        in_dm = is_dm(driver)
-        thread_open = is_thread_open(driver)
+        in_dm = is_slack_dm(driver)
+        thread_open = is_slack_thread_open(driver)
         messages_list = []
 
         if thread_open:
             logger.info("Thread is open. Collecting messages in thread up to last message from 'me'.")
             # Find the last message from 'me' in the thread
-            last_message_from_me_in_thread_ts_float = find_last_message_from_me_in_thread(driver)
+            last_message_from_me_in_thread_ts_float = slack_find_last_message_from_me_in_thread(driver)
 
             # Collect messages in the thread
             messages = driver.find_elements(By.CSS_SELECTOR, "div.c-virtual_list__item--thread div.c-message_kit__background")
 
             # Use the timestamp of the last message from 'me' in the thread
-            messages_list = collect_messages_from_elements(messages, None, last_message_from_me_in_thread_ts_float)
+            messages_list = slack_collect_messages_from_elements(messages, None, last_message_from_me_in_thread_ts_float)
         elif in_dm:
             if last_message_from_me_ts_float is None:
                 logger.info("No previous message from 'me' found in DM. Not collecting any messages.")
@@ -335,7 +338,7 @@ def collect_messages_after(driver, last_message_from_me_ts_float):
                 logger.info("In a DM. Collecting messages sent after last message from 'me'.")
                 # Collect messages in the DM
                 messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
-                messages_list = collect_messages_from_elements(messages, last_message_from_me_ts_float)
+                messages_list = slack_collect_messages_from_elements(messages, last_message_from_me_ts_float)
         else:
             if last_message_from_me_ts_float is None:
                 logger.info("No previous message from 'me' found in channel. Not collecting any messages.")
@@ -344,7 +347,7 @@ def collect_messages_after(driver, last_message_from_me_ts_float):
                 logger.info("In a channel. Collecting messages sent after last message from 'me'.")
                 # Collect messages in the channel
                 messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
-                messages_list = collect_messages_from_elements(messages, last_message_from_me_ts_float)
+                messages_list = slack_collect_messages_from_elements(messages, last_message_from_me_ts_float)
 
         return messages_list
 
@@ -352,26 +355,26 @@ def collect_messages_after(driver, last_message_from_me_ts_float):
         logger.exception("Error collecting messages.")
         return []
 
-def detect_new_messages(driver, last_processed_ts_float):
+def slack_detect_new_messages(driver, last_processed_ts_float):
     """
     Detects new messages based on the current context: DM, channel, or thread.
     """
     try:
         # Determine context
-        in_dm = is_dm(driver)
-        thread_open = is_thread_open(driver)
+        in_dm = is_slack_dm(driver)
+        thread_open = is_slack_thread_open(driver)
         new_messages = []
 
         if thread_open:
             logger.info("Thread is open. Detecting new messages in thread up to last message from 'me'.")
             # Find the last message from 'me' in the thread
-            last_message_from_me_in_thread_ts_float = find_last_message_from_me_in_thread(driver)
+            last_message_from_me_in_thread_ts_float = slack_find_last_message_from_me_in_thread(driver)
 
             # Collect messages in the thread
             messages = driver.find_elements(By.CSS_SELECTOR, "div.c-virtual_list__item--thread div.c-message_kit__background")
 
             # Use the timestamp of the last message from 'me' in the thread
-            new_messages = detect_new_messages_from_elements(messages, last_processed_ts_float, last_message_from_me_in_thread_ts_float)
+            new_messages = slack_detect_new_messages_from_elements(messages, last_processed_ts_float, last_message_from_me_in_thread_ts_float)
         elif in_dm:
             if last_processed_ts_float is None:
                 logger.info("No previous message from 'me' found in DM. Not detecting new messages.")
@@ -380,7 +383,7 @@ def detect_new_messages(driver, last_processed_ts_float):
                 logger.info("In a DM. Detecting new messages.")
                 # Collect messages in the DM
                 messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
-                new_messages = detect_new_messages_from_elements(messages, last_processed_ts_float)
+                new_messages = slack_detect_new_messages_from_elements(messages, last_processed_ts_float)
         else:
             if last_processed_ts_float is None:
                 logger.info("No previous message from 'me' found in channel. Not detecting new messages.")
@@ -389,7 +392,7 @@ def detect_new_messages(driver, last_processed_ts_float):
                 logger.info("In a channel. Detecting new messages.")
                 # Collect messages in the channel
                 messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
-                new_messages = detect_new_messages_from_elements(messages, last_processed_ts_float)
+                new_messages = slack_detect_new_messages_from_elements(messages, last_processed_ts_float)
 
         return new_messages
 
@@ -398,7 +401,7 @@ def detect_new_messages(driver, last_processed_ts_float):
         return []
 
 
-def detect_new_messages_from_elements(messages, last_processed_ts_float, last_message_from_me_ts_float_in_thread=None):
+def slack_detect_new_messages_from_elements(messages, last_processed_ts_float, last_message_from_me_ts_float_in_thread=None):
     """
     Detects new messages from given message elements after last_processed_ts_float and before last_message_from_me_ts_float_in_thread.
     """
@@ -426,14 +429,14 @@ def detect_new_messages_from_elements(messages, last_processed_ts_float, last_me
                 continue
 
         # Extract sender name
-        sender_name = extract_sender_name(message)
+        sender_name = slack_extract_sender_name(message)
         # Skip messages sent by 'me' to prevent feedback loops
         if "pearl" in sender_name.lower():
             continue
         # Extract message content
-        message_text = extract_message_text(message)
+        message_text = slack_extract_message_text(message)
         # Extract timestamp
-        timestamp = extract_timestamp(message_id)
+        timestamp = slack_extract_timestamp(message_id)
         # Hash the sender's name
         hashed_sender_name = hash_sender_name_with_salt(sender_name)
         # Add message to the list
@@ -449,7 +452,7 @@ def detect_new_messages_from_elements(messages, last_processed_ts_float, last_me
     return new_messages
 
 
-def send_message_via_websocket(content, timestamp, hashed_sender_name):
+def send_slack_message_via_websocket(content, timestamp, hashed_sender_name):
     """
     Sends the new message to the back end via WebSocket.
     """
@@ -581,129 +584,240 @@ def notify_chat_changed(new_chat_id):
     except Exception as e:
         logger.exception("Failed to emit 'chatChanged' event.")
 
-def messaging_client():
-    global driver
-
-    # Connect to WebSocket server
+def extract_sender_name_instagram(message):
+    """
+    Extract the sender's name from a message element.
+    """
     try:
-        sio.connect(f"{WEBSOCKET_SERVER_URL}/messaging", namespaces=["/messaging"])
-        logger.info(f"Connecting to WebSocket server: {WEBSOCKET_SERVER_URL}/messaging")
+        sender_element = message.find_element(By.XPATH, './/h5/span')
+        sender_name = sender_element.text.strip()
+        logger.info(f"Extracted sender name: {sender_name}")
+    except NoSuchElementException:
+        sender_name = "Unknown"
+        logger.info("Sender name not found; defaulting to 'Unknown'.")
     except Exception as e:
-        logger.exception("Failed to connect to WebSocket server.")
-        sys.exit(1)
+        logger.exception("Unexpected error while extracting sender name.")
+        sender_name = "Unknown"
+    return sender_name
 
-    # Initialize Selenium WebDriver
-    driver = initialize_selenium()
-    logger.info("Selenium WebDriver initialized and connected to Chrome.")
+def extract_message_text_instagram(message):
+    """
+    Extract the message text from a message element.
+    """
+    try:
+        # This XPath finds divs with dir="auto" that are not ancestors of h5 (i.e., not the sender's name)
+        text_element = message.find_element(By.XPATH, './/div[@dir="auto" and not(ancestor::h5)]')
+        message_text = text_element.text.strip()
+        logger.info(f"Extracted message text: {message_text}")
+    except NoSuchElementException:
+        message_text = ""
+        logger.info("Message text not found.")
+    except Exception as e:
+        logger.exception("Unexpected error while extracting message text.")
+        message_text = ""
+    return message_text
 
-    # Get initial chat ID and thread state
-    previous_chat_id = get_current_chat_id(driver)
-    previous_thread_open = is_thread_open(driver)
+def collect_new_messages_instagram(driver):
+    """Collect all messages from current chat"""
+    try:
+        # Messages are within div elements with role='row'
+        message_elements = driver.find_elements(By.CSS_SELECTOR, "div[role='row']")
+        messages = []
+        
+        for index, element in enumerate(message_elements, start=1):
+            try:
+                sender = extract_sender_name_instagram(element)
+                content = extract_message_text_instagram(element)
+                if sender != "You" and content and (sender, content) not in seen_messages:
+                    messages.append({
+                        'sender_name': sender,
+                        'content': content
+                    })
+                    seen_messages.add((sender, content))
+            except Exception as e:
+                logger.info(f"Skipped message element {index}: {str(e)}")
+                continue
 
-    # Initialize last_message_from_me_ts_float and last_processed_ts_float
-    last_message_from_me_ts_float = find_last_message_from_me(driver)
+        
+        logger.info(f"Collected {len(messages)} new messages.")
+        print(messages)
+                
+        return messages
+        
+    except Exception as e:
+        logger.error(f"Error collecting messages: {str(e)}")
+        return []
+
+def get_current_chat_id_instagram(driver):
+    """
+    Extract the chat ID from the current URL.
+    """
+    try:
+        current_url = driver.current_url
+        logger.info(f"Current URL: {current_url}")
+        parsed_url = urllib.parse.urlparse(current_url)
+        parts = parsed_url.path.strip('/').split('/')
+        if len(parts) >= 3 and parts[0] == 'direct' and parts[1] == 't':
+            chat_id = parts[2]
+            logger.info(f"Current chat ID: {chat_id}")
+            return chat_id
+        else:
+            logger.warning("Unable to determine current chat ID from URL.")
+            return None
+    except Exception as e:
+        logger.exception("Error getting current chat ID.")
+        return None
+
+def notify_chat_changed_instagram(new_chat_id):
+    """
+    Notify that the chat has changed. Currently, it logs the change.
+    """
+    logger.info(f"Chat changed to: {new_chat_id}")
+
+def find_last_you_message_index_instagram(messages):
+    """
+    Find the index of the last message sent by 'You' or 'You sent'.
+    """
+    for i in range(len(messages)-1, -1, -1):  # Search backwards
+        if messages[i]['sender_name'] in ['You', 'You sent']:
+            return i
+    return -1  # Return -1 if no "You" messages found
+
+def process_new_messages_instagram(messages):
+    """
+    Process only messages after the last 'You' message to avoid duplicates.
+    """
+    last_you_idx = find_last_you_message_index_instagram(messages)
+    messages_to_process = messages[last_you_idx + 1:] if last_you_idx >= 0 else messages
+    
+    for message in messages_to_process:
+        sender_name = message['sender_name']
+        content = message['content']
+        logger.info(f'Processing message: "{content}" from {sender_name}')
+        
+        if sender_name == "Unknown":
+            # Assume it's not 'You' and send it
+            sio.emit('newMessage', {'content': content, 'user_id': USER_ID})
+            logger.info(f'Message from "Unknown" sent to back end via WebSocket: "{content}"')
+        elif sender_name not in ['You', 'You sent']:
+            # It's a message from someone else, send via WebSocket
+            sio.emit('newMessage', {'content': content, 'user_id': USER_ID})
+            logger.info(f'Message from "{sender_name}" sent to back end via WebSocket: "{content}"')
+        else:
+            # It's a message from 'You', skip
+            logger.info("Skipping message from 'You'.")
+
+def handle_response_to_send_instagram(data):
+    """
+    Handle incoming responses from the back end to send to Instagram.
+    """
+    try:
+        response = data.get('response')
+        if response:
+            send_response_to_instagram(response)
+    except Exception as e:
+        logger.exception("Error handling response to send.")
+
+def send_response_to_instagram(response):
+    """
+    Send the response message to Instagram.
+    """
+    try:
+        wait = WebDriverWait(driver, 10)
+        message_input = wait.until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//textarea[contains(@aria-label,'Message')]")
+            )
+        )
+        message_input.click()
+        message_input.send_keys(response)
+        message_input.send_keys(Keys.ENTER)
+        logger.info(f"Sent response to Instagram: {response}")
+    except NoSuchElementException:
+        logger.exception("Failed to locate Instagram message input.")
+    except ElementNotInteractableException:
+        logger.exception("Instagram message input not interactable.")
+    except Exception as e:
+        logger.exception("Failed to send response to Instagram.")
+
+
+def messaging_client(mode='slack'):
+    if mode == 'instagram':
+        logger.info("Using Instagram logic.")
+        driver = initialize_selenium_instagram()
+        client = InstagramClient(driver)
+    else:
+        logger.info("Using Slack logic.")
+        driver = initialize_selenium_slack()
+        client = SlackClient(driver)
+
+    # Now reuse the same flow:
+    previous_chat_id = client.get_current_chat_id()
+    previous_thread_open = client.is_thread_open()
+    last_message_from_me_ts_float = client.find_last_message_from_me()
     last_processed_ts_float = last_message_from_me_ts_float
 
-    # Collect messages after last message from 'me'
-    if previous_thread_open:
-        # For thread, find last message from 'me' in thread
-        last_message_from_me_in_thread_ts_float = find_last_message_from_me_in_thread(driver)
-        messages_to_process = collect_messages_after(driver, None)
-        # Update last_processed_ts_float
-        if messages_to_process:
-            last_processed_ts_float = float(messages_to_process[-1]['message_id'])
-    else:
-        messages_to_process = collect_messages_after(driver, last_message_from_me_ts_float)
-        # Update last_processed_ts_float
-        if messages_to_process:
-            last_processed_ts_float = float(messages_to_process[-1]['message_id'])
+    messages_to_process = client.collect_messages_after(None) if previous_thread_open else client.collect_messages_after(last_message_from_me_ts_float)
+    if messages_to_process:
+        last_processed_ts_float = float(messages_to_process[-1]['message_id'])
 
-    # Process messages
     for message in messages_to_process:
-        message_id = message['message_id']
         content = message['content']
         timestamp = message['timestamp']
         hashed_sender_name = message['hashed_sender_name']
+        logger.info(f'Processing message: "{content}" at {timestamp} from {hashed_sender_name}')
+        client.send_message_via_websocket(content, timestamp, hashed_sender_name)
 
-        logger.info(f'Processing message: "{content}" at {timestamp} (ID: {message_id}) from {hashed_sender_name}')
-        # Send the message to the back end via WebSocket
-        send_message_via_websocket(content, timestamp, hashed_sender_name)
-
-    # Main loop
     while running:
         try:
-            # Check current chat ID and thread state
-            current_chat_id = get_current_chat_id(driver)
-            current_thread_open = is_thread_open(driver)
+            current_chat_id = client.get_current_chat_id()
+            current_thread_open = client.is_thread_open()
 
-            # If chat ID or thread state has changed, reset state
             if current_chat_id != previous_chat_id or current_thread_open != previous_thread_open:
-                logger.info(f"Chat or thread state changed. Resetting state.")
+                logger.info("Chat or thread state changed. Resetting state.")
                 previous_chat_id = current_chat_id
-
-                # Emit the 'chatChanged' event to notify the back-end
-                notify_chat_changed(current_chat_id)
-
-                # Reset state variables
-                last_message_from_me_ts_float = find_last_message_from_me(driver)
+                client.notify_chat_changed(current_chat_id)
+                last_message_from_me_ts_float = client.find_last_message_from_me()
                 last_processed_ts_float = last_message_from_me_ts_float
+                messages_to_process = client.collect_messages_after(None) if current_thread_open else client.collect_messages_after(last_message_from_me_ts_float)
+                if messages_to_process:
+                    last_processed_ts_float = float(messages_to_process[-1]['message_id'])
 
-                # Collect messages after last message from 'me'
-                if current_thread_open:
-                    last_message_from_me_in_thread_ts_float = find_last_message_from_me_in_thread(driver)
-                    messages_to_process = collect_messages_after(driver, None)
-                    # Update last_processed_ts_float
-                    if messages_to_process:
-                        last_processed_ts_float = float(messages_to_process[-1]['message_id'])
-                else:
-                    messages_to_process = collect_messages_after(driver, last_message_from_me_ts_float)
-                    # Update last_processed_ts_float
-                    if messages_to_process:
-                        last_processed_ts_float = float(messages_to_process[-1]['message_id'])
-
-                # Process messages
                 for message in messages_to_process:
-                    message_id = message['message_id']
                     content = message['content']
                     timestamp = message['timestamp']
                     hashed_sender_name = message['hashed_sender_name']
+                    logger.info(f'Processing message: "{content}" at {timestamp} from {hashed_sender_name}')
+                    client.send_message_via_websocket(content, timestamp, hashed_sender_name)
 
-                    logger.info(f'Processing message: "{content}" at {timestamp} (ID: {message_id})')
-                    # Send the message to the back end via WebSocket
-                    send_message_via_websocket(content, timestamp, hashed_sender_name)
             else:
-                # Detect new messages after last_processed_ts_float
-                new_messages = detect_new_messages(driver, last_processed_ts_float)
+                new_messages = client.detect_new_messages(last_processed_ts_float)
                 if new_messages:
                     for message in new_messages:
                         message_id = message['message_id']
                         content = message['content']
                         timestamp = message['timestamp']
                         hashed_sender_name = message['hashed_sender_name']
-
-                        logger.info(f'New message detected: "{content}" at {timestamp} (ID: {message_id})')
-
-                        # Send the message to the back end via WebSocket
-                        send_message_via_websocket(content, timestamp, hashed_sender_name)
-
-                        # Update the last_processed_ts_float
+                        logger.info(f'New message detected: "{content}" at {timestamp}')
+                        client.send_message_via_websocket(content, timestamp, hashed_sender_name)
                         last_processed_ts_float = float(message_id)
                 else:
                     logger.debug("No new messages detected.")
 
-            # Update previous_thread_open
             previous_thread_open = current_thread_open
+            time.sleep(POLL_INTERVAL)
 
         except Exception as e:
             logger.exception("Error in main loop.")
 
-        # Poll every POLL_INTERVAL seconds
-        time.sleep(POLL_INTERVAL)
-
-
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', choices=['slack', 'instagram'], default='slack',
+                        help='Messaging client mode (slack or instagram).')
+    args = parser.parse_args()
+
     try:
-        # Start the messaging client
-        messaging_client()
+        messaging_client(mode=args.mode)
     except Exception as e:
         logger.exception("Failed to start messaging client.")

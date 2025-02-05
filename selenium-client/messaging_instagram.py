@@ -166,7 +166,7 @@ def notify_chat_changed_instagram(new_chat_id):
     """
     logger.info(f"Chat changed to: {new_chat_id}")
 
-def find_last_you_message_index(messages):
+def find_last_you_message_index_instagram(messages):
     """
     Find the index of the last message sent by 'You' or 'You sent'.
     """
@@ -175,11 +175,11 @@ def find_last_you_message_index(messages):
             return i
     return -1  # Return -1 if no "You" messages found
 
-def process_new_messages(messages):
+def process_new_messages_instagram(messages):
     """
     Process only messages after the last 'You' message to avoid duplicates.
     """
-    last_you_idx = find_last_you_message_index(messages)
+    last_you_idx = find_last_you_message_index_instagram(messages)
     messages_to_process = messages[last_you_idx + 1:] if last_you_idx >= 0 else messages
     
     for message in messages_to_process:
@@ -205,7 +205,7 @@ def on_response_to_send(data):
     Receive response to send from back end and send to Instagram.
     """
     logger.info(f"Received response to send: {data}")
-    handle_response_to_send(data)
+    handle_response_to_send_instagram(data)
 
 @sio.on('send_message_to_client')
 def on_send_message_to_client(data):
@@ -220,7 +220,7 @@ def on_send_message_to_client(data):
         except Exception as e:
             logger.exception("Failed to send message from front end to Instagram.")
 
-def handle_response_to_send(data):
+def handle_response_to_send_instagram(data):
     """
     Handle incoming responses from the back end to send to Instagram.
     """
@@ -273,7 +273,7 @@ def main():
             if current_chat_id:
                 notify_chat_changed_instagram(current_chat_id)
             messages = collect_new_messages_instagram(driver)
-            process_new_messages(messages)
+            process_new_messages_instagram(messages)
             time.sleep(5)  # Adjust the sleep time as needed
         
     except Exception as e:
