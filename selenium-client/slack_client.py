@@ -7,6 +7,9 @@ from selenium.webdriver.support import expected_conditions as EC
 import time
 import urllib.parse
 import uuid
+import hmac
+import hashlib
+import os
 # Configure logger
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -15,9 +18,36 @@ formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(messag
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
+PEPPER = os.getenv('PEPPER', 'SuperSecretPepperValue') 
+
 class SlackClient:
     def __init__(self, driver):
         self.driver = driver
+    
+    def derive_salt(self, sender_name, pepper):
+        """
+        Derives a deterministic salt based on the sender's name and a secret pepper.
+        """
+        return hmac.new(
+            key=pepper.encode('utf-8'),
+            msg=sender_name.encode('utf-8'),
+            digestmod=hashlib.sha256
+        ).digest()[:16]  # Use the first 16 bytes as the salt
+
+    def hash_sender_name(self, sender_name, salt, pepper):
+        """
+        Hashes the sender's name using SHA-256 with a derived salt and pepper.
+        """
+        hasher = hashlib.sha256()
+        hasher.update(sender_name.encode('utf-8') + salt + pepper.encode('utf-8'))
+        return hasher.hexdigest()
+
+    def hash_sender_name_with_salt(self, sender_name):
+        # Derive the salt for this sender
+        salt = self.derive_salt(sender_name, PEPPER)
+        # Hash the sender's name
+        hashed_sender_name = self.hash_sender_name(sender_name, salt, PEPPER)
+        return hashed_sender_name
 
     def send_response_to_slack(self, response):
         """
@@ -81,6 +111,36 @@ class SlackClient:
             logger.exception("Failed to send response to Slack.")
 
 
+    def is_slack_dm(self):
+            """
+            Determines if the current chat is a DM or a channel based on the aria-label attribute.
+            """
+            try:
+                main_content = self.driver.find_element(By.CSS_SELECTOR, 'div.p-view_contents.p-view_contents--primary')
+                aria_label = main_content.get_attribute('aria-label')
+                if (aria_label):
+                    if "Conversation with" in aria_label:
+                        return True
+                    elif "Channel" in aria_label:
+                        return False
+                return False
+            except NoSuchElementException:
+                return False
+
+    def is_thread_open(self):
+        """
+        Determines if a thread is open by checking for the presence of the thread pane.
+        """
+        try:
+            thread_pane = self.driver.find_element(By.CSS_SELECTOR, 'div.p-threads_view')
+            thread_pane = self.driver.find_element(By.CSS_SELECTOR, 'div.p-threads_view')
+            if thread_pane.is_displayed():
+                return True
+            else:
+                return False
+        except NoSuchElementException:
+            return False
+
 
     def slack_detect_new_messages(self, last_processed_ts_float):
 
@@ -89,20 +149,20 @@ class SlackClient:
         """
         try:
             # Determine context
-            in_dm = is_slack_dm()
-            thread_open = is_thread_open()
+            in_dm = self.is_slack_dm()
+            thread_open = self.is_thread_open()
             new_messages = []
 
             if thread_open:
                 logger.info("Thread is open. Detecting new messages in thread up to last message from 'me'.")
                 # Find the last message from 'me' in the thread
-                last_message_from_me_in_thread_ts_float = find_last_message_from_me()
+                last_message_from_me_in_thread_ts_float = self.find_last_message_from_me()
 
                 # Collect messages in the thread
-                messages = driver.find_elements(By.CSS_SELECTOR, "div.c-virtual_list__item--thread div.c-message_kit__background")
+                messages = self.driver.find_elements(By.CSS_SELECTOR, "div.c-virtual_list__item--thread div.c-message_kit__background")
 
                 # Use the timestamp of the last message from 'me' in the thread
-                new_messages = detect_new_messages_from_elements(messages, last_processed_ts_float, last_message_from_me_in_thread_ts_float)
+                new_messages = self.detect_new_messages_from_elements(messages, last_processed_ts_float, last_message_from_me_in_thread_ts_float)
             elif in_dm:
                 if last_processed_ts_float is None:
                     logger.info("No previous message from 'me' found in DM. Not detecting new messages.")
@@ -110,8 +170,8 @@ class SlackClient:
                 else:
                     logger.info("In a DM. Detecting new messages.")
                     # Collect messages in the DM
-                    messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
-                    new_messages = detect_new_messages_from_elements(messages, last_processed_ts_float)
+                    messages = self.driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
+                    new_messages = self.detect_new_messages_from_elements(messages, last_processed_ts_float)
             else:
                 if last_processed_ts_float is None:
                     logger.info("No previous message from 'me' found in channel. Not detecting new messages.")
@@ -119,8 +179,8 @@ class SlackClient:
                 else:
                     logger.info("In a channel. Detecting new messages.")
                     # Collect messages in the channel
-                    messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
-                    new_messages = detect_new_messages_from_elements(messages, last_processed_ts_float)
+                    messages = self.driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
+                    new_messages = self.detect_new_messages_from_elements(messages, last_processed_ts_float)
 
             return new_messages
 
@@ -130,7 +190,7 @@ class SlackClient:
 
 
 
-    def slack_detect_new_messages_from_elements(messages, last_processed_ts_float, last_message_from_me_ts_float_in_thread=None):
+    def slack_detect_new_messages_from_elements(self,messages, last_processed_ts_float, last_message_from_me_ts_float_in_thread=None):
         """
         Detects new messages from given message elements after last_processed_ts_float and before last_message_from_me_ts_float_in_thread.
         """
@@ -158,16 +218,16 @@ class SlackClient:
                     continue
 
             # Extract sender name
-            sender_name = slack_extract_sender_name(message)
+            sender_name = self.slack_extract_sender_name(message)
             # Skip messages sent by 'me' to prevent feedback loops
             if "pearl" in sender_name.lower():
                 continue
             # Extract message content
-            message_text = slack_extract_message_text(message)
+            message_text = self.slack_extract_message_text(message)
             # Extract timestamp
-            timestamp = slack_extract_timestamp(message_id)
+            timestamp = self.slack_extract_timestamp(message_id)
             # Hash the sender's name
-            hashed_sender_name = hash_sender_name_with_salt(sender_name)
+            hashed_sender_name = self.hash_sender_name_with_salt(sender_name)
             # Add message to the list
             new_messages.append({
                 'message_id': message_id,
@@ -182,7 +242,7 @@ class SlackClient:
         
 
 
-    def slack_collect_messages_from_elements(messages, last_message_from_me_ts_float, last_message_from_me_ts_float_in_thread=None):
+    def slack_collect_messages_from_elements(self, messages, last_message_from_me_ts_float, last_message_from_me_ts_float_in_thread=None):
         """
         Collect messages sent after the last message from 'me' (or up to last message from 'me' in thread), based on timestamps.
         """
@@ -210,16 +270,16 @@ class SlackClient:
                     continue
 
             # Extract sender name
-            sender_name = slack_extract_sender_name(message)
+            sender_name = self.slack_extract_sender_name(message)
             # Skip messages sent by 'me' to prevent feedback loops
             if "pearl" in sender_name.lower():
                 continue
             # Extract message content
-            message_text = slack_extract_message_text(message)
+            message_text = self.slack_extract_message_text(message)
             # Extract timestamp
-            timestamp = slack_extract_timestamp(message_id)
+            timestamp = self.slack_extract_timestamp(message_id)
             # Hash the sender's name
-            hashed_sender_name = hash_sender_name_with_salt(sender_name)
+            hashed_sender_name = self.hash_sender_name_with_salt(sender_name)
             # Add message to the list
             messages_list.append({
                 'message_id': message_id,
@@ -231,7 +291,7 @@ class SlackClient:
         return messages_list
         
     
-    def slack_extract_sender_name(message):
+    def slack_extract_sender_name(self, message):
         sender_name = "Unknown"
 
         possible_selectors = [
@@ -249,14 +309,14 @@ class SlackClient:
             except NoSuchElementException:
                 continue
 
-        sender_name = slack_normalize_sender_name(sender_name)
+        sender_name = self.slack_normalize_sender_name(sender_name)
 
         if sender_name == "Unknown":
             logger.warning("Could not extract sender name for a message.")
 
         return sender_name
 
-    def slack_normalize_sender_name(sender_name):
+    def slack_normalize_sender_name(self, sender_name):
         # Remove leading/trailing whitespace
         sender_name = sender_name.strip()
 
@@ -272,7 +332,7 @@ class SlackClient:
         return sender_name
 
 
-    def slack_extract_message_text(message):
+    def slack_extract_message_text(self, message):
         try:
             message_text_element = message.find_element(By.CSS_SELECTOR, "div.c-message_kit__blocks")
             message_text = message_text_element.text.strip()
@@ -280,7 +340,7 @@ class SlackClient:
             message_text = ""
         return message_text
 
-    def slack_extract_timestamp(message_id):
+    def slack_extract_timestamp(self, message_id):
         try:
             ts_float = float(message_id)
             timestamp = int(ts_float * 1000)
@@ -289,36 +349,6 @@ class SlackClient:
         return timestamp
 
     
-    def is_slack_dm(self):
-        """
-        Determines if the current chat is a DM or a channel based on the aria-label attribute.
-        """
-        try:
-            main_content = self.driver.find_element(By.CSS_SELECTOR, 'div.p-view_contents.p-view_contents--primary')
-            aria_label = main_content.get_attribute('aria-label')
-            if (aria_label):
-                if "Conversation with" in aria_label:
-                    return True
-                elif "Channel" in aria_label:
-                    return False
-            return False
-        except NoSuchElementException:
-            return False
-
-    def is_thread_open(self):
-        """
-        Determines if a thread is open by checking for the presence of the thread pane.
-        """
-        try:
-            thread_pane = self.driver.find_element(By.CSS_SELECTOR, 'div.p-threads_view')
-            thread_pane = driver.find_element(By.CSS_SELECTOR, 'div.p-threads_view')
-            if thread_pane.is_displayed():
-                return True
-            else:
-                return False
-        except NoSuchElementException:
-            return False
-
     def find_last_message_from_me(self):
         """
         Finds the last message sent by 'me' (pearl) in Slack.
@@ -327,13 +357,13 @@ class SlackClient:
         """
         try:
             # Locate message elements
-            messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
+            messages = self.driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
 
             # Go through messages from newest to oldest
             for message in reversed(messages):
-                logger.info(f"Message: {slack_extract_message_text(message)}")
+                logger.info(f"Message: {self.slack_extract_message_text(message)}")
                 # Extract sender name
-                sender_name = slack_extract_sender_name(message)
+                sender_name = self.slack_extract_sender_name(message)
                 logger.info(f"Sender name: {sender_name}")
                 # Check if the sender is 'me'
                 if "pearl" in sender_name.lower():
@@ -363,20 +393,20 @@ class SlackClient:
         """
         try:
             # Determine context
-            in_dm = is_slack_dm(driver)
-            thread_open = is_slack_thread_open(driver)
+            in_dm = self.is_slack_dm()
+            thread_open = self.is_slack_thread_open()
             messages_list = []
 
             if thread_open:
                 logger.info("Thread is open. Collecting messages in thread up to last message from 'me'.")
                 # Find the last message from 'me' in the thread
-                last_message_from_me_in_thread_ts_float = slack_find_last_message_from_me_in_thread(driver)
+                last_message_from_me_in_thread_ts_float = self.slack_find_last_message_from_me_in_thread()
 
                 # Collect messages in the thread
-                messages = driver.find_elements(By.CSS_SELECTOR, "div.c-virtual_list__item--thread div.c-message_kit__background")
+                messages = self.driver.find_elements(By.CSS_SELECTOR, "div.c-virtual_list__item--thread div.c-message_kit__background")
 
                 # Use the timestamp of the last message from 'me' in the thread
-                messages_list = slack_collect_messages_from_elements(messages, None, last_message_from_me_in_thread_ts_float)
+                messages_list = self.slack_collect_messages_from_elements(messages, None, last_message_from_me_in_thread_ts_float)
             elif in_dm:
                 if last_message_from_me_ts_float is None:
                     logger.info("No previous message from 'me' found in DM. Not collecting any messages.")
@@ -384,8 +414,8 @@ class SlackClient:
                 else:
                     logger.info("In a DM. Collecting messages sent after last message from 'me'.")
                     # Collect messages in the DM
-                    messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
-                    messages_list = slack_collect_messages_from_elements(messages, last_message_from_me_ts_float)
+                    messages = self.driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
+                    messages_list = self.slack_collect_messages_from_elements(messages, last_message_from_me_ts_float)
             else:
                 if last_message_from_me_ts_float is None:
                     logger.info("No previous message from 'me' found in channel. Not collecting any messages.")
@@ -393,8 +423,8 @@ class SlackClient:
                 else:
                     logger.info("In a channel. Collecting messages sent after last message from 'me'.")
                     # Collect messages in the channel
-                    messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
-                    messages_list = slack_collect_messages_from_elements(messages, last_message_from_me_ts_float)
+                    messages = self.driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
+                    messages_list = self.slack_collect_messages_from_elements(messages, last_message_from_me_ts_float)
 
             return messages_list
 
@@ -408,20 +438,20 @@ class SlackClient:
         """
         try:
             # Determine context
-            in_dm = is_slack_dm(driver)
-            thread_open = is_slack_thread_open(driver)
+            in_dm = self.is_slack_dm()
+            thread_open = self.is_slack_thread_open()
             new_messages = []
 
             if thread_open:
                 logger.info("Thread is open. Detecting new messages in thread up to last message from 'me'.")
                 # Find the last message from 'me' in the thread
-                last_message_from_me_in_thread_ts_float = slack_find_last_message_from_me_in_thread(driver)
+                last_message_from_me_in_thread_ts_float = self.slack_find_last_message_from_me_in_thread()
 
                 # Collect messages in the thread
-                messages = driver.find_elements(By.CSS_SELECTOR, "div.c-virtual_list__item--thread div.c-message_kit__background")
+                messages = self.driver.find_elements(By.CSS_SELECTOR, "div.c-virtual_list__item--thread div.c-message_kit__background")
 
                 # Use the timestamp of the last message from 'me' in the thread
-                new_messages = slack_detect_new_messages_from_elements(messages, last_processed_ts_float, last_message_from_me_in_thread_ts_float)
+                new_messages = self.slack_detect_new_messages_from_elements(messages, last_processed_ts_float, last_message_from_me_in_thread_ts_float)
             elif in_dm:
                 if last_processed_ts_float is None:
                     logger.info("No previous message from 'me' found in DM. Not detecting new messages.")
@@ -429,8 +459,8 @@ class SlackClient:
                 else:
                     logger.info("In a DM. Detecting new messages.")
                     # Collect messages in the DM
-                    messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
-                    new_messages = slack_detect_new_messages_from_elements(messages, last_processed_ts_float)
+                    messages = self.driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
+                    new_messages = self.slack_detect_new_messages_from_elements(messages, last_processed_ts_float)
             else:
                 if last_processed_ts_float is None:
                     logger.info("No previous message from 'me' found in channel. Not detecting new messages.")
@@ -438,52 +468,14 @@ class SlackClient:
                 else:
                     logger.info("In a channel. Detecting new messages.")
                     # Collect messages in the channel
-                    messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
-                    new_messages = slack_detect_new_messages_from_elements(messages, last_processed_ts_float)
+                    messages = self.driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
+                    new_messages = self.slack_detect_new_messages_from_elements(messages, last_processed_ts_float)
 
             return new_messages
 
         except Exception as e:
             logger.exception("Error detecting new messages.")
             return []
-
-    def notify_chat_changed(self, new_chat_id):
-        """
-        Emits a 'chatChanged' event to the back-end via WebSocket.
-        Args:
-            new_chat_id (str): The identifier of the new chat.
-        """
-        try:
-            # Emit the 'chatChanged' event to the backend's '/messaging' namespace
-            sio.emit(
-                "chatChanged",
-                {"new_chat_id": new_chat_id},
-                namespace="/messaging",
-            )
-            logger.info(f"Emitted 'chatChanged' event with new_chat_id: {new_chat_id}")
-        except Exception as e:
-            logger.exception("Failed to emit 'chatChanged' event.")
-
-    def send_message_via_websocket(self, content, timestamp, hashed_sender_name):
-        """
-        Sends the new message to the back end via WebSocket.
-        """
-        try:
-            # Send the content, timestamp, and hashed sender's name
-            sio.emit(
-                "newMessage",
-                {
-                    "content": content,
-                    "timestamp": timestamp,
-                    "user_id": USER_ID,
-                    "hashed_sender_name": hashed_sender_name,
-                },
-                namespace="/messaging",
-            )
-            logger.info(f'Sent message via WebSocket: "{content}" at {timestamp}')
-        except Exception as e:
-            logger.exception("Failed to send message via WebSocket.")
-
 
     def get_current_chat_id(self):
         """

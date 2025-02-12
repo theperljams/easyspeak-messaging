@@ -34,7 +34,6 @@ WEBSOCKET_SERVER_URL = os.getenv("WEBSOCKET_SERVER_URL", "http://localhost:3000"
 USER_ID = os.getenv(
     "USER_ID", "pearl@easyspeak-aac.com"
 )  # Replace with your actual user ID or email
-PEPPER = os.getenv('PEPPER', 'SuperSecretPepperValue')  # Securely store this in production
 POLL_INTERVAL = 5  # Seconds between polling requests
 
 # Initialize Socket.IO client
@@ -76,31 +75,6 @@ def initialize_selenium():
     return driver
    
 
-def derive_salt(sender_name, pepper):
-    """
-    Derives a deterministic salt based on the sender's name and a secret pepper.
-    """
-    return hmac.new(
-        key=pepper.encode('utf-8'),
-        msg=sender_name.encode('utf-8'),
-        digestmod=hashlib.sha256
-    ).digest()[:16]  # Use the first 16 bytes as the salt
-
-def hash_sender_name(sender_name, salt, pepper):
-    """
-    Hashes the sender's name using SHA-256 with a derived salt and pepper.
-    """
-    hasher = hashlib.sha256()
-    hasher.update(sender_name.encode('utf-8') + salt + pepper.encode('utf-8'))
-    return hasher.hexdigest()
-
-def hash_sender_name_with_salt(sender_name):
-    # Derive the salt for this sender
-    salt = derive_salt(sender_name, PEPPER)
-    # Hash the sender's name
-    hashed_sender_name = hash_sender_name(sender_name, salt, PEPPER)
-    return hashed_sender_name
-
 
 @sio.on("sendSelectedResponse", namespace="/messaging")
 def on_send_selected_response(data):
@@ -112,6 +86,45 @@ def on_send_selected_response(data):
         logger.error("Received sendSelectedResponse event without selected_response")
 
 
+def notify_chat_changed(new_chat_id):
+        """
+        Emits a 'chatChanged' event to the back-end via WebSocket.
+        Args:
+            new_chat_id (str): The identifier of the new chat.
+        """
+        try:
+            # Emit the 'chatChanged' event to the backend's '/messaging' namespace
+            sio.emit(
+                "chatChanged",
+                {"new_chat_id": new_chat_id},
+                namespace="/messaging",
+            )
+            logger.info(f"Emitted 'chatChanged' event with new_chat_id: {new_chat_id}")
+        except Exception as e:
+            logger.exception("Failed to emit 'chatChanged' event.")
+
+def send_message_via_websocket(content, timestamp, hashed_sender_name):
+    """
+    Sends the new message to the back end via WebSocket.
+    """
+    try:
+        # Send the content, timestamp, and hashed sender's name
+        sio.emit(
+            "newMessage",
+            {
+                "content": content,
+                "timestamp": timestamp,
+                "user_id": USER_ID,
+                "hashed_sender_name": hashed_sender_name,
+            },
+            namespace="/messaging",
+        )
+        logger.info(f'Sent message via WebSocket: "{content}" at {timestamp}')
+    except Exception as e:
+        logger.exception("Failed to send message via WebSocket.")
+
+
+
 def notify_chat_changed_instagram(new_chat_id):
     """
     Notify that the chat has changed. Currently, it logs the change.
@@ -120,13 +133,13 @@ def notify_chat_changed_instagram(new_chat_id):
 
 
 def messaging_client(mode='slack'):
+
+    driver = initialize_selenium()
     if mode == 'instagram':
         logger.info("Using Instagram logic.")
-        driver = initialize_selenium_instagram()
         client = InstagramClient(driver)
     else:
         logger.info("Using Slack logic.")
-        driver = initialize_selenium_slack()
         client = SlackClient(driver)
 
     # Now reuse the same flow:
