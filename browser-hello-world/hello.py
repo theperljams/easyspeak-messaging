@@ -11,15 +11,10 @@ CHROME_EXECUTABLE_PATH = "/usr/bin/google-chrome"  # Confirmed path
 
 browser = Browser(
     config=BrowserConfig(
-        chrome_instance_path=CHROME_EXECUTABLE_PATH,
-        extra_chromium_args=[
-            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-            "--disable-blink-features=AutomationControlled"  # Helps avoid detection
-        ],
-        headless=False  # Ensure it's running in a visible mode
+        cdp_url="http://localhost:9222",
+        headless=False
     )
 )
-
 
 # Initialize the model
 llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash-lite-preview-02-05", temperature=0.0)
@@ -28,13 +23,17 @@ llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash-lite-preview-02-05", temper
 sensitive_data = {'google_name': 'email', 'google_password': 'password'}
 
 # Use the placeholder names in your task description
-task = '''go to https://slack.com/signin#/signin. Choose "Sign In with Google" login with google_name and google_password. 
-Wait for the user to do the MFA on their end. Once login has succeeded, open the JustBuild worksapce (you may have to click on "show more workspaces). 
-Press "Cancel" on the popup and choose "Use slack in the browser. Find the #saturdays-at-byu channel and send a message saying: "Guys look what I did with browser-use! 
-(It logged in, found this channel, and sent this message all on its own!) It has a feature that allows you to pass sensitive data to the agent without the model ever seeing it."'''
+# task = '''Go to the slack tab that is already open and logged in. Find the #saturdays-at-byu channel and send a message saying: "Guys look what I did with browser use!
+# I had to log in manually from a debug window but it was able to find the channel and send this message." '''
+
+task = '''Go to the instagram tab that is already open and logged in. Find Ananya Kumaresh in my dms.
+If you can't find their name, bring up their chat by starting a new dm with them. DO NOT send a message 
+to anyone who is not Ananya Kumaresh. You should check and make sure it says their name at the top of the page.
+Then respond to their message as best you can.
+If you aren't sure, just come up with something that seems about right.'''
 
 # Pass the sensitive data to the agent
-agent = Agent(task=task, llm=llm, sensitive_data=sensitive_data)
+agent = Agent(task=task, llm=llm, browser=browser)
 
 # Global flag to signal shutdown
 shutdown_flag = False
