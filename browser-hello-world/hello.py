@@ -39,12 +39,16 @@ llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash-lite", temperature=0.0)
 # task = '''Go to the Outlook tab that is already open and logged in. Send an email to recipient_one with the subject: "Warming Up the Domains" and a body asking about how Borea and school are going. When do they graduate and what their next steps?
 # Do the same for recipient_two.'''
 
-task = '''Go to the slack tab that is already open and logged in. Start a new dm with . If there is a message I have not replied to, reply to it. 
-Then send them a message asking how Vessium is going and remind them that they are a killer. 
-DO NOT send a message to anyone who is not Justin. You should check and make sure it says their name at the top of the page. 
-'''
+# task = '''Go to the slack tab that is already open and logged in. Start a new dm with . If there is a message I have not replied to, reply to it. 
+# Then send them a message asking how Vessium is going and remind them that they are a killer. 
+# DO NOT send a message to anyone who is not Justin. You should check and make sure it says their name at the top of the page. 
+# '''
 
-sensitive_data = {'sender_one': 'Kamilla Turapova'}
+# task = '''Go to the slack tab that is already open and logged in. Click on each channel, starting at the top. Give me a list of the channel and dm names.'''
+
+task = '''Go to the slack tab that is already open and logged in. Send a direct message to Kaden Birch. Ask them how they're doing.'''
+
+sensitive_data = {'sender_one': 'Diana Cervantes'}
 
 # Pass the sensitive data to the agent
 agent = Agent(task=task, llm=llm, browser=browser)
