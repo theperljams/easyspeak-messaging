@@ -581,6 +581,59 @@ def notify_chat_changed(new_chat_id):
     except Exception as e:
         logger.exception("Failed to emit 'chatChanged' event.")
 
+def process_chat_change(driver):
+    """
+    Handles chat/thread state changes by collecting and processing new messages.
+    Returns the new state values.
+    """
+    # Find last message from 'me'
+    last_message_from_me_ts_float = find_last_message_from_me(driver)
+    
+    if last_message_from_me_ts_float is None:
+        # If no previous messages from me, get the last 5 messages
+        try:
+            messages = driver.find_elements(By.CSS_SELECTOR, "div.c-message_kit__background")
+            messages_to_process = []
+            
+            # Take up to last 5 messages, excluding messages from 'me'
+            for message in reversed(messages[-5:] if len(messages) > 5 else messages):
+                sender_name = extract_sender_name(message)
+                if "pearl" not in sender_name.lower():
+                    timestamp_element = message.find_element(By.CSS_SELECTOR, "a.c-timestamp")
+                    message_id = timestamp_element.get_attribute("data-ts")
+                    content = extract_message_text(message)
+                    timestamp = extract_timestamp(message_id)
+                    hashed_sender_name = hash_sender_name_with_salt(sender_name)
+                    
+                    messages_to_process.insert(0, {
+                        'message_id': message_id,
+                        'content': content,
+                        'timestamp': timestamp,
+                        'hashed_sender_name': hashed_sender_name
+                    })
+        except Exception as e:
+            logger.exception("Error collecting last 5 messages")
+            messages_to_process = []
+    else:
+        # Collect messages after last message from 'me'
+        messages_to_process = collect_messages_after(driver, last_message_from_me_ts_float)
+    
+    # Update last_processed_ts_float if we found messages
+    last_processed_ts_float = (
+        float(messages_to_process[-1]['message_id']) if messages_to_process 
+        else last_message_from_me_ts_float
+    )
+        
+    # Process all messages
+    for message in messages_to_process:
+        send_message_via_websocket(
+            message['content'], 
+            message['timestamp'], 
+            message['hashed_sender_name']
+        )
+        
+    return last_message_from_me_ts_float, last_processed_ts_float
+
 def messaging_client():
     global driver
 
@@ -596,38 +649,10 @@ def messaging_client():
     driver = initialize_selenium()
     logger.info("Selenium WebDriver initialized and connected to Chrome.")
 
-    # Get initial chat ID and thread state
+    # Initialize state tracking variables
     previous_chat_id = get_current_chat_id(driver)
     previous_thread_open = is_thread_open(driver)
-
-    # Initialize last_message_from_me_ts_float and last_processed_ts_float
-    last_message_from_me_ts_float = find_last_message_from_me(driver)
-    last_processed_ts_float = last_message_from_me_ts_float
-
-    # Collect messages after last message from 'me'
-    if previous_thread_open:
-        # For thread, find last message from 'me' in thread
-        last_message_from_me_in_thread_ts_float = find_last_message_from_me_in_thread(driver)
-        messages_to_process = collect_messages_after(driver, None)
-        # Update last_processed_ts_float
-        if messages_to_process:
-            last_processed_ts_float = float(messages_to_process[-1]['message_id'])
-    else:
-        messages_to_process = collect_messages_after(driver, last_message_from_me_ts_float)
-        # Update last_processed_ts_float
-        if messages_to_process:
-            last_processed_ts_float = float(messages_to_process[-1]['message_id'])
-
-    # Process messages
-    for message in messages_to_process:
-        message_id = message['message_id']
-        content = message['content']
-        timestamp = message['timestamp']
-        hashed_sender_name = message['hashed_sender_name']
-
-        logger.info(f'Processing message: "{content}" at {timestamp} (ID: {message_id}) from {hashed_sender_name}')
-        # Send the message to the back end via WebSocket
-        send_message_via_websocket(content, timestamp, hashed_sender_name)
+    last_message_from_me_ts_float, last_processed_ts_float = process_chat_change(driver)
 
     # Main loop
     while running:
@@ -636,62 +661,29 @@ def messaging_client():
             current_chat_id = get_current_chat_id(driver)
             current_thread_open = is_thread_open(driver)
 
-            # If chat ID or thread state has changed, reset state
+            # If chat ID or thread state has changed
             if current_chat_id != previous_chat_id or current_thread_open != previous_thread_open:
-                logger.info(f"Chat or thread state changed. Resetting state.")
+                logger.info("Chat or thread state changed. Resetting state.")
                 previous_chat_id = current_chat_id
-
-                # Emit the 'chatChanged' event to notify the back-end
                 notify_chat_changed(current_chat_id)
-
-                # Reset state variables
-                last_message_from_me_ts_float = find_last_message_from_me(driver)
-                last_processed_ts_float = last_message_from_me_ts_float
-
-                # Collect messages after last message from 'me'
-                if current_thread_open:
-                    last_message_from_me_in_thread_ts_float = find_last_message_from_me_in_thread(driver)
-                    messages_to_process = collect_messages_after(driver, None)
-                    # Update last_processed_ts_float
-                    if messages_to_process:
-                        last_processed_ts_float = float(messages_to_process[-1]['message_id'])
-                else:
-                    messages_to_process = collect_messages_after(driver, last_message_from_me_ts_float)
-                    # Update last_processed_ts_float
-                    if messages_to_process:
-                        last_processed_ts_float = float(messages_to_process[-1]['message_id'])
-
-                # Process messages
-                for message in messages_to_process:
-                    message_id = message['message_id']
-                    content = message['content']
-                    timestamp = message['timestamp']
-                    hashed_sender_name = message['hashed_sender_name']
-
-                    logger.info(f'Processing message: "{content}" at {timestamp} (ID: {message_id})')
-                    # Send the message to the back end via WebSocket
-                    send_message_via_websocket(content, timestamp, hashed_sender_name)
+                
+                # Process the chat change
+                last_message_from_me_ts_float, last_processed_ts_float = process_chat_change(driver)
             else:
-                # Detect new messages after last_processed_ts_float
+                # Detect and process any new messages
                 new_messages = detect_new_messages(driver, last_processed_ts_float)
                 if new_messages:
                     for message in new_messages:
-                        message_id = message['message_id']
-                        content = message['content']
-                        timestamp = message['timestamp']
-                        hashed_sender_name = message['hashed_sender_name']
-
-                        logger.info(f'New message detected: "{content}" at {timestamp} (ID: {message_id})')
-
-                        # Send the message to the back end via WebSocket
-                        send_message_via_websocket(content, timestamp, hashed_sender_name)
-
-                        # Update the last_processed_ts_float
-                        last_processed_ts_float = float(message_id)
+                        send_message_via_websocket(
+                            message['content'],
+                            message['timestamp'],
+                            message['hashed_sender_name']
+                        )
+                        last_processed_ts_float = float(message['message_id'])
                 else:
                     logger.debug("No new messages detected.")
 
-            # Update previous_thread_open
+            # Update previous thread state
             previous_thread_open = current_thread_open
 
         except Exception as e:
